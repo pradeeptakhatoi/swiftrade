@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dhan-algo"
+version = "0.1.0"
+description = "Algorithmic trading toolkit for DhanHQ"
+requires-python = ">=3.11"
+dependencies = [
+    "dhanhq",
+    "pydantic-settings",
+    "pyotp",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+dhan-algo = "dhan_algo.cli:main"

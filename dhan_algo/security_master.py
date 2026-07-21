@@ -1,0 +1,50 @@
+"""Security-ID resolution from symbol names."""
+
+from __future__ import annotations
+
+from dhanhq import dhanhq
+
+KNOWN_IDS = {
+    "RELIANCE": "2885",
+    "TCS": "11536",
+    "INFY": "1594",
+    "HDFCBANK": "1333",
+    "SBIN": "3045",
+}
+
+
+def resolve_security_id(
+    client: dhanhq, symbol: str, segment_hint: str = "NSE"
+) -> str | None:
+    """Look up a security_id by trading symbol from the scrip master.
+
+    Downloads the compact master once (needs pandas, pulled in by dhanhq).
+    Column names are matched flexibly so this survives minor schema changes.
+    """
+    symbol = symbol.upper().strip()
+    if symbol in KNOWN_IDS:
+        return KNOWN_IDS[symbol]
+
+    df = client.fetch_security_list("compact")  # returns a pandas DataFrame
+    cols = list(df.columns)
+
+    def find(substr: str) -> str | None:
+        return next((c for c in cols if substr in c.upper()), None)
+
+    sid_col = find("SECURITY_ID")
+    sym_col = (
+        next((c for c in cols if c.upper() == "SEM_TRADING_SYMBOL"), None)
+        or find("SYMBOL")
+    )
+    exch_col = find("EXCH_ID") or find("SEGMENT")
+    if not (sid_col and sym_col):
+        print("Could not identify columns in scrip master:", cols)
+        return None
+
+    m = df[df[sym_col].astype(str).str.upper() == symbol]
+    if exch_col is not None:
+        m = m[m[exch_col].astype(str).str.upper().str.contains(segment_hint, na=False)]
+    if m.empty:
+        print(f"No match for {symbol} in {segment_hint}")
+        return None
+    return str(m.iloc[0][sid_col])
