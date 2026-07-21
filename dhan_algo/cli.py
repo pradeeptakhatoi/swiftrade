@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 from dhan_algo.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,8 +57,14 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         sys.exit(1)
 
-    # Apply --live flag before loading settings
     settings = get_settings()
+
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
     if args.live:
         settings.dhan_live = True
 
@@ -67,7 +76,7 @@ def main(argv: list[str] | None = None) -> None:
 
     client = get_client(settings)
     mode = "LIVE -- orders will be SENT" if settings.dhan_live else "DRY_RUN (safe)"
-    print(f"Mode: {mode}\n")
+    logger.info("Mode: %s", mode)
 
     if args.command == "funds":
         show_funds(client)
@@ -76,7 +85,7 @@ def main(argv: list[str] | None = None) -> None:
         sid = resolve_security_id(client, args.symbol)
         if sid:
             price = ltp(client, sid)
-            print(f"{args.symbol} (security_id={sid}) LTP = {price}")
+            logger.info("%s (security_id=%s) LTP = %s", args.symbol, sid, price)
 
     elif args.command == "order":
         sid = resolve_security_id(client, args.symbol)

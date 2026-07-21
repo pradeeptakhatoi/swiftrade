@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     max_order_value: float = 50_000
     max_daily_loss: float = 10_000
     strategy_interval: int = 60
+    log_level: str = "INFO"
+    journal_path: str = "trades.csv"
 
 
 @lru_cache(maxsize=1)

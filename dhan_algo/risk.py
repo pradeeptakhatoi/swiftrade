@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 from dhanhq import dhanhq
 
 from dhan_algo.client import ok
 from dhan_algo.config import Settings, get_settings
 from dhan_algo.market_data import ltp
+
+logger = logging.getLogger(__name__)
 
 
 def _realized_pnl(client: dhanhq) -> float:
@@ -52,5 +56,5 @@ def check_order(
 def kill_switch(client: dhanhq) -> dict:
     """Activate the Dhan kill switch — disables trading for the rest of the day."""
     resp = client.kill_switch("activate")
-    print("Kill switch activated:", resp)
+    logger.info("Kill switch activated: %s", resp)
     return resp

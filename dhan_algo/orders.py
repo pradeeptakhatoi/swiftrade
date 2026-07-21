@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+
 from dhanhq import dhanhq
 
 from dhan_algo.client import ok
 from dhan_algo.config import Settings, get_settings
+from dhan_algo.journal import record as journal_record
 from dhan_algo.market_data import ltp
 from dhan_algo.risk import check_order
+
+logger = logging.getLogger(__name__)
 
 
 def place(
@@ -32,7 +37,18 @@ def place(
     ref_price = price if price > 0 else (ltp(client, security_id, d_seg) or 0)
     block_reason = check_order(qty, ref_price, security_id, client, settings)
     if block_reason:
-        print(f"BLOCKED: {block_reason}")
+        logger.warning("BLOCKED: %s", block_reason)
+        journal_record(
+            security_id=security_id,
+            side=side.upper(),
+            qty=qty,
+            order_type=order_type,
+            product=product,
+            price=ref_price,
+            notional=ref_price * qty,
+            status="blocked",
+            detail=block_reason,
+        )
         return None
 
     notional = ref_price * qty
@@ -42,7 +58,18 @@ def place(
     )
 
     if not settings.dhan_live:
-        print(f"[DRY_RUN] would place: {plan}")
+        logger.info("[DRY_RUN] would place: %s", plan)
+        journal_record(
+            security_id=security_id,
+            side=side.upper(),
+            qty=qty,
+            order_type=order_type,
+            product=product,
+            price=ref_price,
+            notional=notional,
+            status="dry_run",
+            detail=plan,
+        )
         return {"status": "dry_run", "plan": plan}
 
     resp = client.place_order(
@@ -54,15 +81,43 @@ def place(
         product_type=prod,
         price=float(price),
     )
-    print(("PLACED: " if ok(resp) else "ORDER FAILED: "), resp)
+    if ok(resp):
+        logger.info("PLACED: %s", resp)
+        journal_record(
+            security_id=security_id,
+            side=side.upper(),
+            qty=qty,
+            order_type=order_type,
+            product=product,
+            price=ref_price,
+            notional=notional,
+            status="placed",
+            detail=str(resp),
+        )
+    else:
+        logger.warning("ORDER FAILED: %s", resp)
+        journal_record(
+            security_id=security_id,
+            side=side.upper(),
+            qty=qty,
+            order_type=order_type,
+            product=product,
+            price=ref_price,
+            notional=notional,
+            status="failed",
+            detail=str(resp),
+        )
     return resp
 
 
 def show_positions(client: dhanhq) -> None:
     resp = client.get_positions()
-    print("Positions:", resp.get("data") if ok(resp) else resp)
+    logger.info("Positions: %s", resp.get("data") if ok(resp) else resp)
 
 
 def show_orders(client: dhanhq) -> None:
     resp = client.get_order_list()
-    print("Orders:", resp.get("data") if ok(resp) else resp)
+    if ok(resp):
+        logger.info("Orders: %s", resp.get("data"))
+    else:
+        logger.error("Orders query failed: %s", resp)

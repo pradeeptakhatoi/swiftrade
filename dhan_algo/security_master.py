@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from dhanhq import dhanhq
+
+logger = logging.getLogger(__name__)
 
 KNOWN_IDS = {
     "RELIANCE": "2885",
@@ -38,13 +42,13 @@ def resolve_security_id(
     )
     exch_col = find("EXCH_ID") or find("SEGMENT")
     if not (sid_col and sym_col):
-        print("Could not identify columns in scrip master:", cols)
+        logger.error("Could not identify columns in scrip master: %s", cols)
         return None
 
     m = df[df[sym_col].astype(str).str.upper() == symbol]
     if exch_col is not None:
         m = m[m[exch_col].astype(str).str.upper().str.contains(segment_hint, na=False)]
     if m.empty:
-        print(f"No match for {symbol} in {segment_hint}")
+        logger.error("No match for %s in %s", symbol, segment_hint)
         return None
     return str(m.iloc[0][sid_col])

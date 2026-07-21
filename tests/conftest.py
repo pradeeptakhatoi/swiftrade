@@ -17,6 +17,8 @@ def test_settings() -> Settings:
         max_order_value=50_000,
         max_daily_loss=10_000,
         strategy_interval=60,
+        log_level="DEBUG",
+        journal_path="test_trades.csv",
     )
 
 

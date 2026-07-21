@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 
 from dhanhq import DhanContext, dhanhq
 
 from dhan_algo.auth import ensure_token
 from dhan_algo.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def get_client(settings: Settings | None = None) -> dhanhq:
@@ -29,6 +32,6 @@ def show_funds(client: dhanhq) -> None:
     if ok(resp):
         data = resp.get("data", {})
         avail = data.get("availabelBalance", data)  # note: Dhan's key spelling
-        print(f"Funds / available balance: {avail}")
+        logger.info("Funds / available balance: %s", avail)
     else:
-        print("Could not fetch funds:", resp)
+        logger.error("Could not fetch funds: %s", resp)

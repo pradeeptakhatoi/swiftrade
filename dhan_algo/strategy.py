@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -12,6 +13,8 @@ from dhanhq import dhanhq
 from dhan_algo.config import Settings, get_settings
 from dhan_algo.market_data import ltp
 from dhan_algo.orders import place
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,9 +47,10 @@ def run_strategy_loop(
 ) -> None:
     """Poll LTP at the configured interval, route orders through place()."""
     settings = settings or get_settings()
-    print(
-        f"Starting strategy loop for security {security_id} "
-        f"(interval={settings.strategy_interval}s). Ctrl+C to stop."
+    logger.info(
+        "Starting strategy loop for security %s (interval=%ds). Ctrl+C to stop.",
+        security_id,
+        settings.strategy_interval,
     )
     try:
         while True:
@@ -65,7 +69,7 @@ def run_strategy_loop(
                 )
             time.sleep(settings.strategy_interval)
     except KeyboardInterrupt:
-        print("\nStrategy loop stopped.")
+        logger.info("Strategy loop stopped.")
 
 
 class SmaDemo(Strategy):
@@ -92,15 +96,17 @@ class SmaDemo(Strategy):
 
         self._prices.append(price)
         if len(self._prices) < self.long_period:
-            print(
-                f"[SMA] collecting prices ({len(self._prices)}/{self.long_period})..."
+            logger.debug(
+                "[SMA] collecting prices (%d/%d)...",
+                len(self._prices),
+                self.long_period,
             )
             return None
 
         prices = list(self._prices)
         short_sma = sum(prices[-self.short_period :]) / self.short_period
         long_sma = sum(prices) / self.long_period
-        print(f"[SMA] short={short_sma:.2f}  long={long_sma:.2f}  ltp={price:.2f}")
+        logger.debug("[SMA] short=%.2f  long=%.2f  ltp=%.2f", short_sma, long_sma, price)
 
         signal: Order | None = None
         if (
@@ -108,10 +114,10 @@ class SmaDemo(Strategy):
             and self._prev_long is not None
         ):
             if self._prev_short <= self._prev_long and short_sma > long_sma:
-                print("[SMA] golden cross -> BUY")
+                logger.info("[SMA] golden cross -> BUY")
                 signal = Order(side="BUY", qty=self.qty)
             elif self._prev_short >= self._prev_long and short_sma < long_sma:
-                print("[SMA] death cross -> SELL")
+                logger.info("[SMA] death cross -> SELL")
                 signal = Order(side="SELL", qty=self.qty)
 
         self._prev_short = short_sma
