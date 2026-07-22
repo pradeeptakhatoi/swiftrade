@@ -16,6 +16,20 @@ KNOWN_IDS = {
     "SBIN": "3045",
 }
 
+# Module-level cache for the security master DataFrame
+_security_master_cache: dict[str, object] = {}
+
+
+def _get_security_master(client: dhanhq):
+    """Fetch and cache the compact security master DataFrame."""
+    cache_key = "compact"
+    if cache_key not in _security_master_cache:
+        df = client.fetch_security_list(cache_key)
+        if df is not None:
+            _security_master_cache[cache_key] = df
+        return df
+    return _security_master_cache[cache_key]
+
 
 def resolve_security_id(
     client: dhanhq, symbol: str, segment_hint: str = "NSE"
@@ -29,7 +43,10 @@ def resolve_security_id(
     if symbol in KNOWN_IDS:
         return KNOWN_IDS[symbol]
 
-    df = client.fetch_security_list("compact")  # returns a pandas DataFrame
+    df = _get_security_master(client)
+    if df is None:
+        logger.error("Security master returned None — cannot resolve %s", symbol)
+        return None
     cols = list(df.columns)
 
     def find(substr: str) -> str | None:

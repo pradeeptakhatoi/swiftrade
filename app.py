@@ -25,6 +25,38 @@ from intraday_scorer import score_single_intraday, score_universe_intraday
 from swing_scorer import score_single, score_universe
 
 # ---------------------------------------------------------------------------
+# Stock universes — NIFTY 50 & NIFTY 100 constituents
+# ---------------------------------------------------------------------------
+
+NIFTY_50: list[str] = [
+    "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
+    "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BPCL", "BRITANNIA",
+    "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT",
+    "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO",
+    "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY",
+    "ITC", "JSWSTEEL", "KOTAKBANK", "LT", "LTIM",
+    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
+    "SUNPHARMA", "TATAMOTORS", "TATASTEEL", "TATACONSUM", "TCS",
+    "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+]
+
+NIFTY_NEXT_50: list[str] = [
+    "ABB", "ADANIENT", "AMBUJACEM", "ATGL", "AUBANK",
+    "BANKBARODA", "BEL", "BHEL", "BOSCHLTD", "CANBK",
+    "COLPAL", "DLF", "GAIL", "GODREJCP", "HAL",
+    "HAVELLS", "ICICIPRULI", "ICICIGI", "IDFCFIRSTB", "IGL",
+    "IOC", "IRCTC", "JINDALSTEL", "JIOFIN", "LUPIN",
+    "MARICO", "MAXHEALTH", "NAUKRI", "NHPC", "OFSS",
+    "PAGEIND", "PEL", "PERSISTENT", "PETRONET", "PFC",
+    "PIDILITIND", "PNB", "POLYCAB", "RECLTD", "SAIL",
+    "SBICARD", "SIEMENS", "TATAPOWER", "TORNTPHARM", "TVSMOTOR",
+    "UNITDSPR", "VEDL", "ZOMATO", "MCDOWELL-N", "LTF",
+]
+
+NIFTY_100: list[str] = NIFTY_50 + NIFTY_NEXT_50
+
+# ---------------------------------------------------------------------------
 # Logging capture — collect log records for in-app display
 # ---------------------------------------------------------------------------
 
@@ -615,14 +647,25 @@ def page_intraday() -> None:
     settings = _get_settings()
 
     # --- Configuration sidebar-like controls ---
-    col_sym, col_interval = st.columns([3, 1])
-    with col_sym:
-        symbols_input = st.text_input(
-            "Symbols (comma-separated)",
-            value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
-            key="intra_symbols",
-            help="Enter NSE symbols to scan",
+    col_uni, col_interval = st.columns([3, 1])
+    with col_uni:
+        universe = st.selectbox(
+            "Stock Universe",
+            ["NIFTY 50", "NIFTY 100", "Custom"],
+            key="intra_universe",
+            help="Pre-built universe or enter your own symbols",
         )
+        if universe == "Custom":
+            symbols_input = st.text_input(
+                "Symbols (comma-separated)",
+                value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
+                key="intra_symbols",
+                help="Enter NSE symbols to scan",
+            )
+        else:
+            symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
+            symbols_input = ", ".join(symbol_list)
+            st.caption(f"{len(symbol_list)} stocks selected")
     with col_interval:
         interval_minutes = st.selectbox(
             "Candle interval",
@@ -661,46 +704,39 @@ def page_intraday() -> None:
             st.warning("Enter at least one symbol.")
             return
 
-        try:
-            client = _get_client()
-        except (SystemExit, Exception) as e:
-            st.error(f"Client error: {e}")
+        # Fetch intraday data via yfinance (batch download)
+        data: dict[str, pd.DataFrame] = {}
+        tickers_yf = [f"{sym}.NS" for sym in symbols]
+        yf_interval = f"{interval_minutes}m"
+        with st.spinner(f"Fetching intraday data for {len(symbols)} symbols..."):
+            try:
+                df_all = yf.download(
+                    tickers_yf, period="5d", interval=yf_interval,
+                    auto_adjust=True, group_by="ticker", threads=True,
+                )
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+                return
+
+        if df_all is None or df_all.empty:
+            st.error("No data fetched for any symbol.")
             return
 
-        # Resolve security IDs (for order placement later)
-        sym_to_sid: dict[str, str] = {}
+        multi = isinstance(df_all.columns, pd.MultiIndex)
         for sym in symbols:
-            sid = resolve_security_id(client, sym)
-            if sid is not None:
-                sym_to_sid[sym] = sid
-
-        # Fetch intraday data via yfinance
-        data: dict[str, pd.DataFrame] = {}
-        progress = st.progress(0, text="Fetching intraday data...")
-        total = len(symbols)
-        yf_interval = f"{interval_minutes}m"
-        for idx, sym in enumerate(symbols):
+            ticker_yf = f"{sym}.NS"
             try:
-                ticker_yf = f"{sym}.NS"
-                df_bars = yf.Ticker(ticker_yf).history(
-                    period="5d", interval=yf_interval, auto_adjust=True,
-                )
-                if df_bars is not None and len(df_bars) >= 5:
-                    df_bars = df_bars.reset_index()
-                    # Ensure standard OHLCV column names
-                    for col in ("Open", "High", "Low", "Close", "Volume"):
-                        if col not in df_bars.columns:
-                            lc = col.lower()
-                            if lc in df_bars.columns:
-                                df_bars.rename(columns={lc: col}, inplace=True)
+                df_bars = df_all[ticker_yf] if multi else df_all
+                df_bars = df_bars.dropna(how="all").reset_index()
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    if col not in df_bars.columns:
+                        lc = col.lower()
+                        if lc in df_bars.columns:
+                            df_bars.rename(columns={lc: col}, inplace=True)
+                if len(df_bars) >= 5:
                     data[sym] = df_bars
-                else:
-                    st.warning(f"No intraday data for {sym}")
-            except Exception as e:
-                st.warning(f"Error fetching {sym}: {e}")
-            progress.progress((idx + 1) / total, text=f"Fetched {sym}")
-
-        progress.empty()
+            except (KeyError, Exception):
+                pass
 
         if not data:
             st.error("No data fetched for any symbol.")
@@ -715,15 +751,12 @@ def page_intraday() -> None:
             return
 
         st.session_state["intra_results"] = results
-        st.session_state["intra_sym_to_sid"] = sym_to_sid
 
     # --- Display results ---
     results = st.session_state.get("intra_results")
     if not results:
         st.info("Click **Scan Now** to fetch data and score symbols.")
         return
-
-    sym_to_sid = st.session_state.get("intra_sym_to_sid", {})
 
     # Summary table
     st.subheader("Scored Results")
@@ -825,9 +858,7 @@ def page_intraday() -> None:
     if submitted:
         try:
             client = _get_client()
-            sid = sym_to_sid.get(selected_ticker)
-            if sid is None:
-                sid = resolve_security_id(client, selected_ticker)
+            sid = resolve_security_id(client, selected_ticker)
             if sid is None:
                 st.error(f"Could not resolve symbol: {selected_ticker}")
                 return
@@ -861,11 +892,22 @@ def page_swing() -> None:
 
     settings = _get_settings()
 
-    symbols_input = st.text_input(
-        "Symbols (comma-separated)",
-        value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
-        key="swing_symbols",
+    universe = st.selectbox(
+        "Stock Universe",
+        ["NIFTY 50", "NIFTY 100", "Custom"],
+        key="swing_universe",
+        help="Pre-built universe or enter your own symbols",
     )
+    if universe == "Custom":
+        symbols_input = st.text_input(
+            "Symbols (comma-separated)",
+            value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
+            key="swing_symbols",
+        )
+    else:
+        symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
+        symbols_input = ", ".join(symbol_list)
+        st.caption(f"{len(symbol_list)} stocks selected")
 
     # Weight sliders
     with st.expander("Scoring Weights", expanded=False):
@@ -912,43 +954,38 @@ def page_swing() -> None:
             st.warning("Enter at least one symbol.")
             return
 
-        try:
-            client = _get_client()
-        except (SystemExit, Exception) as e:
-            st.error(f"Client error: {e}")
+        # Fetch daily data via yfinance (batch download)
+        data: dict[str, pd.DataFrame] = {}
+        tickers_yf = [f"{sym}.NS" for sym in symbols]
+        with st.spinner(f"Fetching daily data for {len(symbols)} symbols..."):
+            try:
+                df_all = yf.download(
+                    tickers_yf, period="1y",
+                    auto_adjust=True, group_by="ticker", threads=True,
+                )
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+                return
+
+        if df_all is None or df_all.empty:
+            st.error("No data fetched for any symbol.")
             return
 
-        # Resolve security IDs (for order placement later)
-        sym_to_sid: dict[str, str] = {}
+        multi = isinstance(df_all.columns, pd.MultiIndex)
         for sym in symbols:
-            sid = resolve_security_id(client, sym)
-            if sid is not None:
-                sym_to_sid[sym] = sid
-
-        # Fetch daily data via yfinance
-        data: dict[str, pd.DataFrame] = {}
-        progress = st.progress(0, text="Fetching daily data...")
-        total = len(symbols)
-        for idx, sym in enumerate(symbols):
+            ticker_yf = f"{sym}.NS"
             try:
-                ticker_yf = f"{sym}.NS"
-                df_bars = yf.Ticker(ticker_yf).history(period="1y", auto_adjust=True)
-                if df_bars is not None and len(df_bars) >= 220:
-                    df_bars = df_bars.reset_index()
-                    for col in ("Open", "High", "Low", "Close", "Volume"):
-                        if col not in df_bars.columns:
-                            lc = col.lower()
-                            if lc in df_bars.columns:
-                                df_bars.rename(columns={lc: col}, inplace=True)
+                df_bars = df_all[ticker_yf] if multi else df_all
+                df_bars = df_bars.dropna(how="all").reset_index()
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    if col not in df_bars.columns:
+                        lc = col.lower()
+                        if lc in df_bars.columns:
+                            df_bars.rename(columns={lc: col}, inplace=True)
+                if len(df_bars) >= 220:
                     data[sym] = df_bars
-                else:
-                    bars_n = len(df_bars) if df_bars is not None else 0
-                    st.warning(f"{sym}: only {bars_n} daily bars (need 220+). Try a longer history.")
-            except Exception as e:
-                st.warning(f"Error fetching {sym}: {e}")
-            progress.progress((idx + 1) / total, text=f"Fetched {sym}")
-
-        progress.empty()
+            except (KeyError, Exception):
+                pass
 
         if not data:
             st.error("No data fetched for any symbol.")
@@ -963,15 +1000,12 @@ def page_swing() -> None:
             return
 
         st.session_state["swing_results"] = results
-        st.session_state["swing_sym_to_sid"] = sym_to_sid
 
     # --- Display results ---
     results = st.session_state.get("swing_results")
     if not results:
         st.info("Click **Scan Now** to fetch daily data and score symbols.")
         return
-
-    sym_to_sid = st.session_state.get("swing_sym_to_sid", {})
 
     # Summary table
     st.subheader("Scored Results")
@@ -1064,9 +1098,7 @@ def page_swing() -> None:
     if submitted:
         try:
             client = _get_client()
-            sid = sym_to_sid.get(selected_ticker)
-            if sid is None:
-                sid = resolve_security_id(client, selected_ticker)
+            sid = resolve_security_id(client, selected_ticker)
             if sid is None:
                 st.error(f"Could not resolve symbol: {selected_ticker}")
                 return
