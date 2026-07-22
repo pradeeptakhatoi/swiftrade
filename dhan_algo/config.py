@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     strategy_interval: int = 60
     log_level: str = "INFO"
     journal_path: str = "trades.csv"
+    feed_mode: str = "poll"
 
 
 @lru_cache(maxsize=1)

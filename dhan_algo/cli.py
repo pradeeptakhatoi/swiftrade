@@ -41,8 +41,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("orders", help="Show current orders")
 
     strat_p = sub.add_parser("strategy", help="Run the demo SMA strategy loop")
-    strat_p.add_argument("symbol", help="Trading symbol")
+    strat_p.add_argument("symbols", nargs="+", help="Trading symbol(s)")
     strat_p.add_argument("--interval", type=int, default=None)
+    strat_p.add_argument("--ws", action="store_true", help="Use WebSocket feed")
+
+    bt_p = sub.add_parser("backtest", help="Backtest a strategy on historical data")
+    bt_p.add_argument("symbols", nargs="+", help="Trading symbol(s)")
+    bt_p.add_argument("--from", dest="from_date", default=None, help="Start date (YYYY-MM-DD)")
+    bt_p.add_argument("--to", dest="to_date", default=None, help="End date (YYYY-MM-DD)")
+    bt_p.add_argument("--interval", default="day", choices=["day", "minute"])
+    bt_p.add_argument("--csv", dest="csv_path", default=None, help="CSV file path instead of API")
 
     sub.add_parser("kill-switch", help="Activate the Dhan kill switch")
 
@@ -108,14 +116,64 @@ def main(argv: list[str] | None = None) -> None:
         show_orders(client)
 
     elif args.command == "strategy":
-        from dhan_algo.strategy import SmaDemo, run_strategy_loop
+        from dhan_algo.strategy import (
+            SmaDemo,
+            SmaDemoMulti,
+            run_multi_strategy_loop,
+            run_strategy_loop,
+            run_ws_strategy_loop,
+        )
 
-        sid = resolve_security_id(client, args.symbol)
-        if not sid:
-            sys.exit(f"Could not resolve symbol: {args.symbol}")
+        sids = []
+        for sym in args.symbols:
+            sid = resolve_security_id(client, sym)
+            if not sid:
+                sys.exit(f"Could not resolve symbol: {sym}")
+            sids.append(sid)
+
         if args.interval is not None:
             settings.strategy_interval = args.interval
-        run_strategy_loop(SmaDemo(), client, sid, settings=settings)
+
+        if args.ws:
+            strat = SmaDemoMulti() if len(sids) > 1 else SmaDemoMulti()
+            run_ws_strategy_loop(strat, client, sids, settings=settings)
+        elif len(sids) == 1:
+            run_strategy_loop(SmaDemo(), client, sids[0], settings=settings)
+        else:
+            run_multi_strategy_loop(SmaDemoMulti(), client, sids, settings=settings)
+
+    elif args.command == "backtest":
+        from dhan_algo.backtest import (
+            fetch_historical,
+            load_csv,
+            run_backtest,
+        )
+        from dhan_algo.strategy import SmaDemo, SmaDemoMulti
+
+        if args.csv_path:
+            bars = load_csv(args.csv_path)
+        else:
+            if not args.from_date or not args.to_date:
+                sys.exit("--from and --to are required when not using --csv")
+            bars = {}
+            for sym in args.symbols:
+                sid = resolve_security_id(client, sym)
+                if not sid:
+                    sys.exit(f"Could not resolve symbol: {sym}")
+                bars[sid] = fetch_historical(
+                    client, sid,
+                    from_date=args.from_date,
+                    to_date=args.to_date,
+                    interval=args.interval,
+                )
+
+        if len(bars) == 1:
+            strategy: SmaDemo | SmaDemoMulti = SmaDemo()
+        else:
+            strategy = SmaDemoMulti()
+
+        result = run_backtest(strategy, bars, settings=settings)
+        print(result.summary())
 
     elif args.command == "kill-switch":
         kill_switch(client)
