@@ -20,6 +20,7 @@ from dhan_algo.security_master import resolve_security_id
 from dhan_algo.strategy import Order, PollingTicker, SmaDemoMulti
 from dhan_algo.backtest import fetch_historical, load_csv, run_backtest
 from intraday_scorer import score_single_intraday, score_universe_intraday
+from swing_scorer import score_single, score_universe
 
 # ---------------------------------------------------------------------------
 # Logging capture — collect log records for in-app display
@@ -866,12 +867,262 @@ def page_intraday() -> None:
             st.error(f"Error placing order: {e}")
 
 
+def page_swing() -> None:
+    st.header("Swing Scanner & Trade")
+    st.caption("Score stocks using Trend, Momentum, Volume, Breakout & Volatility — place orders from results")
+
+    settings = _get_settings()
+
+    symbols_input = st.text_input(
+        "Symbols (comma-separated)",
+        value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
+        key="swing_symbols",
+    )
+
+    # Weight sliders
+    with st.expander("Scoring Weights", expanded=False):
+        wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
+        with wcol1:
+            w_trend = st.slider("Trend", 0.0, 5.0, 1.0, 0.5, key="sw_trend")
+        with wcol2:
+            w_momentum = st.slider("Momentum", 0.0, 5.0, 1.0, 0.5, key="sw_mom")
+        with wcol3:
+            w_volume = st.slider("Volume", 0.0, 5.0, 0.8, 0.5, key="sw_vol")
+        with wcol4:
+            w_breakout = st.slider("Breakout", 0.0, 5.0, 0.8, 0.5, key="sw_brk")
+        with wcol5:
+            w_volatility = st.slider("Volatility", 0.0, 5.0, 0.5, 0.5, key="sw_vlt")
+
+    with st.expander("Advanced Settings", expanded=False):
+        acol1, acol2 = st.columns(2)
+        with acol1:
+            atr_mult = st.number_input(
+                "Stop-loss ATR multiplier",
+                min_value=0.5, max_value=3.0, value=1.5, step=0.1,
+                key="sw_atr_mult",
+            )
+        with acol2:
+            lookback_days = st.number_input(
+                "History (trading days)",
+                min_value=250, max_value=500, value=365, step=10,
+                key="sw_lookback",
+                help="Number of calendar days of daily data to fetch",
+            )
+
+    weights = {
+        "trend": w_trend,
+        "momentum": w_momentum,
+        "volume": w_volume,
+        "breakout": w_breakout,
+        "volatility": w_volatility,
+    }
+    params = {"atr_multiplier": atr_mult}
+
+    if st.button("Scan Now", type="primary", key="swing_scan"):
+        symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+        if not symbols:
+            st.warning("Enter at least one symbol.")
+            return
+
+        try:
+            client = _get_client()
+        except (SystemExit, Exception) as e:
+            st.error(f"Client error: {e}")
+            return
+
+        # Resolve security IDs
+        sym_to_sid: dict[str, str] = {}
+        for sym in symbols:
+            sid = resolve_security_id(client, sym)
+            if sid is None:
+                st.warning(f"Could not resolve: {sym}")
+            else:
+                sym_to_sid[sym] = sid
+
+        if not sym_to_sid:
+            st.error("No symbols resolved.")
+            return
+
+        # Fetch daily historical data
+        data: dict[str, pd.DataFrame] = {}
+        progress = st.progress(0, text="Fetching daily data...")
+        total = len(sym_to_sid)
+        from_dt = str(date.today() - timedelta(days=lookback_days))
+        to_dt = str(date.today())
+        for idx, (sym, sid) in enumerate(sym_to_sid.items()):
+            try:
+                resp = client.historical_daily_data(
+                    security_id=sid,
+                    exchange_segment="NSE_EQ",
+                    instrument_type="EQUITY",
+                    from_date=from_dt,
+                    to_date=to_dt,
+                )
+                raw = resp.get("data", []) if isinstance(resp, dict) else []
+                if raw:
+                    df_bars = pd.DataFrame(raw)
+                    rename_map = {
+                        "open": "Open", "high": "High", "low": "Low",
+                        "close": "Close", "volume": "Volume",
+                    }
+                    df_bars.rename(columns=rename_map, inplace=True)
+                    data[sym] = df_bars
+                else:
+                    st.warning(f"No daily data for {sym}")
+            except Exception as e:
+                st.warning(f"Error fetching {sym}: {e}")
+            progress.progress((idx + 1) / total, text=f"Fetched {sym}")
+
+        progress.empty()
+
+        if not data:
+            st.error("No data fetched for any symbol.")
+            return
+
+        # Score
+        with st.spinner("Scoring..."):
+            results = score_universe(data, weights, params)
+
+        if not results:
+            st.info("No symbols met the minimum bar requirement (220 daily bars needed).")
+            return
+
+        st.session_state["swing_results"] = results
+        st.session_state["swing_sym_to_sid"] = sym_to_sid
+
+    # --- Display results ---
+    results = st.session_state.get("swing_results")
+    if not results:
+        st.info("Click **Scan Now** to fetch daily data and score symbols.")
+        return
+
+    sym_to_sid = st.session_state.get("swing_sym_to_sid", {})
+
+    # Summary table
+    st.subheader("Scored Results")
+    display_cols = [
+        "ticker", "name", "price", "change_pct", "score",
+        "trend_score", "momentum_score", "volume_score",
+        "breakout_score", "volatility_score",
+    ]
+    df_display = pd.DataFrame(results)[display_cols]
+    df_display.columns = [
+        "Symbol", "Name", "Price", "Change %", "Score",
+        "Trend", "Momentum", "Volume", "Breakout", "Volatility",
+    ]
+
+    def _highlight_score(val):
+        if val >= 75:
+            return "background-color: #1b5e20; color: white"
+        elif val >= 50:
+            return "background-color: #33691e; color: white"
+        elif val >= 25:
+            return "background-color: #e65100; color: white"
+        else:
+            return "background-color: #b71c1c; color: white"
+
+    styled = df_display.style.applymap(_highlight_score, subset=["Score"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # --- Detailed view + order placement ---
+    st.divider()
+    st.subheader("Trade Setup & Order Placement")
+
+    ticker_options = [r["ticker"] for r in results]
+    selected_ticker = st.selectbox(
+        "Select symbol to trade",
+        ticker_options,
+        key="swing_trade_ticker",
+    )
+
+    row = next((r for r in results if r["ticker"] == selected_ticker), None)
+    if row is None:
+        return
+
+    # Trade setup display
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    col_s1.metric("Score", f"{row['score']:.1f}")
+    col_s2.metric("Price", f"{row['price']:,.2f}")
+    col_s3.metric("RSI(14)", f"{row.get('rsi', 0):.1f}")
+    col_s4.metric("Vol Ratio", f"{row.get('vol_ratio', 0):.2f}")
+
+    col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+    col_t1.metric("Entry", f"{row.get('entry', 0):,.2f}")
+    col_t2.metric("Stop Loss", f"{row.get('stop_loss', 0):,.2f}")
+    col_t3.metric("Target 1", f"{row.get('target1', 0):,.2f} (RR {row.get('rr1', 0)})")
+    col_t4.metric("Target 2", f"{row.get('target2', 0):,.2f} (RR {row.get('rr2', 0)})")
+
+    # Indicator summary
+    col_i1, col_i2, col_i3, col_i4 = st.columns(4)
+    with col_i1:
+        st.metric("52wk High %", f"{row.get('pct_from_52wk', 0):.1f}%")
+    with col_i2:
+        st.metric("MACD Hist", f"{row.get('macd_hist', 0):.4f}")
+    with col_i3:
+        st.metric("Bollinger %B", f"{row.get('pct_b', 0):.2f}")
+    with col_i4:
+        st.metric("ATR %", f"{row.get('atr_pct', 0):.2f}%")
+
+    # Order form
+    st.markdown("---")
+    with st.form("swing_order_form"):
+        st.markdown(f"**Place order for {selected_ticker}**")
+        ocol1, ocol2 = st.columns(2)
+        with ocol1:
+            side = st.selectbox("Side", ["BUY", "SELL"], key="sw_side")
+            qty = st.number_input(
+                "Quantity", min_value=1, max_value=settings.max_qty,
+                value=1, key="sw_qty",
+            )
+        with ocol2:
+            order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"], key="sw_otype")
+            product = st.selectbox("Product", ["CNC", "INTRA"], key="sw_product",
+                                   help="CNC for delivery (swing), INTRA for same-day")
+            limit_price = st.number_input(
+                "Limit Price", min_value=0.0,
+                value=round(row.get("entry", row["price"]), 2),
+                step=0.05, key="sw_price",
+            )
+
+        submitted = st.form_submit_button("Place Order", type="primary")
+
+    if submitted:
+        try:
+            client = _get_client()
+            sid = sym_to_sid.get(selected_ticker)
+            if sid is None:
+                sid = resolve_security_id(client, selected_ticker)
+            if sid is None:
+                st.error(f"Could not resolve symbol: {selected_ticker}")
+                return
+
+            result = place(
+                client, sid,
+                side=side, qty=qty,
+                order_type=order_type, product=product,
+                price=limit_price if order_type == "LIMIT" else 0.0,
+            )
+            if result is None:
+                st.error("Order blocked by risk guards. Check logs for details.")
+            elif result.get("status") == "dry_run":
+                st.info(f"[DRY RUN] {result.get('plan', '')}")
+            elif ok(result):
+                st.success(f"Order placed successfully: {result}")
+            else:
+                st.error(f"Order failed: {result}")
+        except SystemExit as e:
+            st.warning(f"Client not configured: {e}")
+        except Exception as e:
+            st.error(f"Error placing order: {e}")
+
+
 # ---------------------------------------------------------------------------
 # App layout
 # ---------------------------------------------------------------------------
 
 PAGES = {
     "Dashboard": page_dashboard,
+    "Swing Scanner": page_swing,
     "Intraday Scanner": page_intraday,
     "Market Data": page_market_data,
     "Place Order": page_place_order,

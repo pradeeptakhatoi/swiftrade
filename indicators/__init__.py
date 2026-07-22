@@ -1,7 +1,7 @@
-"""Intraday technical indicators.
+"""Technical indicators for swing and intraday trading.
 
-``compute_intraday(df)`` enriches a DataFrame (columns: Open, High, Low,
-Close, Volume) with every indicator the intraday scorer needs.
+``compute_all(df)``       — swing-trading indicators (EMA, RSI14, MACD, ATR, Bollinger, breakout).
+``compute_intraday(df)``  — intraday indicators (VWAP, SuperTrend, RSI7, fast MACD, ORB).
 """
 
 from __future__ import annotations
@@ -9,9 +9,35 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .trend import add_trend_indicators
+from .momentum import add_momentum_indicators
+from .volatility import add_volatility_indicators
+from .breakout import add_breakout_indicators
+
+
+def compute_all(df: pd.DataFrame) -> pd.DataFrame:
+    """Swing-trading indicators. Requires at least 30 bars."""
+    if df.empty or len(df) < 30:
+        return df
+    df = add_trend_indicators(df)
+    df = add_momentum_indicators(df)
+    df = add_volatility_indicators(df)
+    df = _add_volume_indicators(df)
+    df = add_breakout_indicators(df)
+    return df
+
+
+def _add_volume_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add vol_avg20 and vol_ratio for swing scoring."""
+    df = df.copy()
+    vol = df["Volume"].replace(0, np.nan)
+    df["vol_avg20"] = vol.rolling(20).mean()
+    df["vol_ratio"] = vol / df["vol_avg20"].replace(0, np.finfo(float).eps)
+    return df
+
 
 # ---------------------------------------------------------------------------
-# Elementary helpers
+# Elementary helpers (used by compute_intraday)
 # ---------------------------------------------------------------------------
 
 
