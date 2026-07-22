@@ -19,6 +19,8 @@ from dhan_algo.risk import kill_switch
 from dhan_algo.security_master import resolve_security_id
 from dhan_algo.strategy import Order, PollingTicker, SmaDemoMulti
 from dhan_algo.backtest import fetch_historical, load_csv, run_backtest
+import yfinance as yf
+
 from intraday_scorer import score_single_intraday, score_universe_intraday
 from swing_scorer import score_single, score_universe
 
@@ -665,46 +667,32 @@ def page_intraday() -> None:
             st.error(f"Client error: {e}")
             return
 
-        # Resolve security IDs
+        # Resolve security IDs (for order placement later)
         sym_to_sid: dict[str, str] = {}
         for sym in symbols:
             sid = resolve_security_id(client, sym)
-            if sid is None:
-                st.warning(f"Could not resolve: {sym}")
-            else:
+            if sid is not None:
                 sym_to_sid[sym] = sid
 
-        if not sym_to_sid:
-            st.error("No symbols resolved.")
-            return
-
-        # Fetch intraday minute data directly via the client
+        # Fetch intraday data via yfinance
         data: dict[str, pd.DataFrame] = {}
         progress = st.progress(0, text="Fetching intraday data...")
-        total = len(sym_to_sid)
-        today = str(date.today())
-        for idx, (sym, sid) in enumerate(sym_to_sid.items()):
+        total = len(symbols)
+        yf_interval = f"{interval_minutes}m"
+        for idx, sym in enumerate(symbols):
             try:
-                resp = client.intraday_minute_data(
-                    security_id=sid,
-                    exchange_segment="NSE_EQ",
-                    instrument_type="EQUITY",
-                    from_date=today,
-                    to_date=today,
-                    interval=interval_minutes,
+                ticker_yf = f"{sym}.NS"
+                df_bars = yf.Ticker(ticker_yf).history(
+                    period="5d", interval=yf_interval, auto_adjust=True,
                 )
-                raw = resp.get("data", []) if isinstance(resp, dict) else []
-                if raw:
-                    df_bars = pd.DataFrame(raw)
-                    # Normalise column names to Title case for the scorer
-                    rename_map = {
-                        "open": "Open",
-                        "high": "High",
-                        "low": "Low",
-                        "close": "Close",
-                        "volume": "Volume",
-                    }
-                    df_bars.rename(columns=rename_map, inplace=True)
+                if df_bars is not None and len(df_bars) >= 5:
+                    df_bars = df_bars.reset_index()
+                    # Ensure standard OHLCV column names
+                    for col in ("Open", "High", "Low", "Close", "Volume"):
+                        if col not in df_bars.columns:
+                            lc = col.lower()
+                            if lc in df_bars.columns:
+                                df_bars.rename(columns={lc: col}, inplace=True)
                     data[sym] = df_bars
                 else:
                     st.warning(f"No intraday data for {sym}")
@@ -761,7 +749,7 @@ def page_intraday() -> None:
         else:
             return "background-color: #b71c1c; color: white"
 
-    styled = df_display.style.applymap(_highlight_score, subset=["Score"])
+    styled = df_display.style.map(_highlight_score, subset=["Score"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # --- Detailed view + order placement ---
@@ -930,45 +918,32 @@ def page_swing() -> None:
             st.error(f"Client error: {e}")
             return
 
-        # Resolve security IDs
+        # Resolve security IDs (for order placement later)
         sym_to_sid: dict[str, str] = {}
         for sym in symbols:
             sid = resolve_security_id(client, sym)
-            if sid is None:
-                st.warning(f"Could not resolve: {sym}")
-            else:
+            if sid is not None:
                 sym_to_sid[sym] = sid
 
-        if not sym_to_sid:
-            st.error("No symbols resolved.")
-            return
-
-        # Fetch daily historical data
+        # Fetch daily data via yfinance
         data: dict[str, pd.DataFrame] = {}
         progress = st.progress(0, text="Fetching daily data...")
-        total = len(sym_to_sid)
-        from_dt = str(date.today() - timedelta(days=lookback_days))
-        to_dt = str(date.today())
-        for idx, (sym, sid) in enumerate(sym_to_sid.items()):
+        total = len(symbols)
+        for idx, sym in enumerate(symbols):
             try:
-                resp = client.historical_daily_data(
-                    security_id=sid,
-                    exchange_segment="NSE_EQ",
-                    instrument_type="EQUITY",
-                    from_date=from_dt,
-                    to_date=to_dt,
-                )
-                raw = resp.get("data", []) if isinstance(resp, dict) else []
-                if raw:
-                    df_bars = pd.DataFrame(raw)
-                    rename_map = {
-                        "open": "Open", "high": "High", "low": "Low",
-                        "close": "Close", "volume": "Volume",
-                    }
-                    df_bars.rename(columns=rename_map, inplace=True)
+                ticker_yf = f"{sym}.NS"
+                df_bars = yf.Ticker(ticker_yf).history(period="1y", auto_adjust=True)
+                if df_bars is not None and len(df_bars) >= 220:
+                    df_bars = df_bars.reset_index()
+                    for col in ("Open", "High", "Low", "Close", "Volume"):
+                        if col not in df_bars.columns:
+                            lc = col.lower()
+                            if lc in df_bars.columns:
+                                df_bars.rename(columns={lc: col}, inplace=True)
                     data[sym] = df_bars
                 else:
-                    st.warning(f"No daily data for {sym}")
+                    bars_n = len(df_bars) if df_bars is not None else 0
+                    st.warning(f"{sym}: only {bars_n} daily bars (need 220+). Try a longer history.")
             except Exception as e:
                 st.warning(f"Error fetching {sym}: {e}")
             progress.progress((idx + 1) / total, text=f"Fetched {sym}")
@@ -1021,7 +996,7 @@ def page_swing() -> None:
         else:
             return "background-color: #b71c1c; color: white"
 
-    styled = df_display.style.applymap(_highlight_score, subset=["Score"])
+    styled = df_display.style.map(_highlight_score, subset=["Score"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # --- Detailed view + order placement ---
