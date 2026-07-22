@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings",
     "pyotp",
     "streamlit",
+    "yfinance"
 ]
 
 [project.optional-dependencies]
