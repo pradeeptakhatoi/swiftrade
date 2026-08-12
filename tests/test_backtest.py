@@ -6,9 +6,12 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from dhan_algo.backtest import (
     BacktestResult,
     ReplayTicker,
+    TradingCosts,
     load_csv,
     run_backtest,
 )
@@ -231,3 +234,131 @@ class TestRunBacktest:
         strategy = SmaDemoMulti(short_period=5, long_period=20, qty=1)
         result = run_backtest(strategy, bars, settings=test_settings)
         assert isinstance(result, BacktestResult)
+
+
+# ---------------------------------------------------------------------------
+# TradingCosts
+# ---------------------------------------------------------------------------
+
+
+class _BuySell(MultiStrategy):
+    """One BUY on the first tick, one SELL on the second."""
+
+    def __init__(self):
+        self._count = 0
+
+    def on_tick(self, ticker: Ticker, security_id: str, segment) -> list[Order]:
+        self._count += 1
+        if self._count == 1:
+            return [Order(side="BUY", qty=1, security_id=security_id)]
+        if self._count == 2:
+            return [Order(side="SELL", qty=1, security_id=security_id)]
+        return []
+
+
+class TestTradingCosts:
+    def test_slippage_adverse_direction(self):
+        costs = TradingCosts(slippage_pct=0.001)
+        assert costs.slippage_price("BUY", 100.0) == pytest.approx(100.1)
+        assert costs.slippage_price("SELL", 100.0) == pytest.approx(99.9)
+
+    def test_brokerage_capped_at_flat(self):
+        costs = TradingCosts()
+        # Small turnover -> percentage brokerage (0.03%).
+        assert costs.brokerage(1000.0) == pytest.approx(0.3)
+        # Huge turnover -> flat cap of Rs 20.
+        assert costs.brokerage(10_000_000.0) == pytest.approx(20.0)
+
+    def test_intraday_stt_sell_side_only(self):
+        costs = TradingCosts()
+        buy = costs.breakdown("BUY", 100.0, 10, product="INTRA")
+        sell = costs.breakdown("SELL", 100.0, 10, product="INTRA")
+        assert buy["stt"] == 0.0
+        assert sell["stt"] == pytest.approx(0.00025 * 1000)
+
+    def test_delivery_stt_both_sides(self):
+        costs = TradingCosts()
+        buy = costs.breakdown("BUY", 100.0, 10, product="CNC")
+        sell = costs.breakdown("SELL", 100.0, 10, product="CNC")
+        assert buy["stt"] == pytest.approx(0.001 * 1000)
+        assert sell["stt"] == pytest.approx(0.001 * 1000)
+
+    def test_stamp_duty_buy_side_only(self):
+        costs = TradingCosts()
+        assert costs.breakdown("BUY", 100.0, 10, product="INTRA")["stamp_duty"] > 0
+        assert costs.breakdown("SELL", 100.0, 10, product="INTRA")["stamp_duty"] == 0.0
+
+    def test_breakdown_total_is_sum_of_components(self):
+        costs = TradingCosts()
+        b = costs.breakdown("SELL", 110.0, 10, product="INTRA")
+        parts = b["brokerage"] + b["stt"] + b["exchange"] + b["sebi"] + b["stamp_duty"] + b["gst"]
+        assert b["total"] == pytest.approx(parts)
+        assert costs.total("SELL", 110.0, 10, "INTRA") == pytest.approx(b["total"])
+
+    def test_gst_on_brokerage_exchange_sebi(self):
+        costs = TradingCosts()
+        b = costs.breakdown("BUY", 100.0, 10, product="INTRA")
+        expected_gst = 0.18 * (b["brokerage"] + b["exchange"] + b["sebi"])
+        assert b["gst"] == pytest.approx(expected_gst)
+
+
+class TestRunBacktestWithCosts:
+    def test_costs_none_is_frictionless(self, test_settings):
+        bars = {"SYM": _make_bars("SYM", [100.0, 110.0])}
+        result = run_backtest(_BuySell(), bars, settings=test_settings, costs=None)
+        assert result.total_costs == 0.0
+        assert result.pnl == 10.0
+        assert result.net_pnl == 10.0
+        assert all(f.cost == 0.0 for f in result.fills)
+
+    def test_costs_reduce_net_pnl(self, test_settings):
+        bars = {"SYM": _make_bars("SYM", [100.0, 110.0])}
+        result = run_backtest(
+            _BuySell(), bars, settings=test_settings, costs=TradingCosts()
+        )
+        assert result.total_costs > 0.0
+        assert result.net_pnl < result.pnl + result.unrealized_pnl
+        # Per-fill cost is recorded and sums to the total.
+        assert sum(f.cost for f in result.fills) == pytest.approx(result.total_costs)
+
+    def test_slippage_worsens_realized_pnl(self, test_settings):
+        """Slippage-only model buys higher and sells lower than close."""
+        bars = {"SYM": _make_bars("SYM", [100.0, 110.0])}
+        costs = TradingCosts(
+            slippage_pct=0.001, brokerage_flat=0.0, brokerage_pct=0.0,
+            stt_delivery=0.0, stt_intraday_sell=0.0, exchange_txn_pct=0.0,
+            sebi_pct=0.0, stamp_duty_delivery=0.0, stamp_duty_intraday=0.0,
+            gst_pct=0.0,
+        )
+        result = run_backtest(_BuySell(), bars, settings=test_settings, costs=costs)
+        # Buy fills at 100.1, sell fills at 109.89 -> realized 9.79 < 10.0.
+        assert result.total_costs == 0.0  # charges zeroed; only slippage
+        assert result.pnl == pytest.approx(9.79)
+        buy_fill = next(f for f in result.fills if f.side == "BUY")
+        sell_fill = next(f for f in result.fills if f.side == "SELL")
+        assert buy_fill.price == pytest.approx(100.1)
+        assert sell_fill.price == pytest.approx(109.89)
+
+    def test_cost_product_override(self, test_settings):
+        """cost_product overrides the order's product for the charge model."""
+        bars = {"SYM": _make_bars("SYM", [100.0, 110.0])}
+        intra = run_backtest(
+            _BuySell(), bars, settings=test_settings,
+            costs=TradingCosts(), cost_product="INTRA",
+        )
+        cnc = run_backtest(
+            _BuySell(), bars, settings=test_settings,
+            costs=TradingCosts(), cost_product="CNC",
+        )
+        # Delivery STT (both sides, 0.1%) dwarfs intraday sell-only STT.
+        assert cnc.total_costs > intra.total_costs
+
+    def test_summary_includes_costs_line(self, test_settings):
+        result = BacktestResult(
+            pnl=150.0, unrealized_pnl=50.0, total_costs=25.0,
+            total_trades=4, buy_count=2, sell_count=2,
+        )
+        summary = result.summary()
+        assert "Costs" in summary
+        assert "25.00" in summary
+        assert "175.00" in summary  # net = 150 + 50 - 25

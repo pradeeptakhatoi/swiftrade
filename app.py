@@ -18,7 +18,7 @@ from dhan_algo.orders import calculate_position_size, place, place_bracket, plac
 from dhan_algo.risk import kill_switch
 from dhan_algo.security_master import resolve_security_id
 from dhan_algo.strategy import Order, PollingTicker, SmaDemoMulti
-from dhan_algo.backtest import fetch_historical, load_csv, run_backtest
+from dhan_algo.backtest import TradingCosts, fetch_historical, load_csv, run_backtest
 import yfinance as yf
 
 from intraday_scorer import score_single_intraday, score_universe_intraday
@@ -542,6 +542,26 @@ def _yf_to_bars(df: pd.DataFrame, symbol: str) -> list[dict]:
 def page_backtest() -> None:
     st.caption("Backtest — SMA crossover replay over historical data")
 
+    with st.expander("Cost model (slippage + charges)", expanded=False):
+        st.session_state.setdefault("bt_apply_costs", True)
+        st.toggle(
+            "Apply realistic costs",
+            key="bt_apply_costs",
+            help="Model adverse slippage and NSE brokerage/taxes/fees. Off = frictionless.",
+        )
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.number_input(
+                "Slippage (bps)", min_value=0.0, max_value=100.0,
+                value=5.0, step=0.5, key="bt_slippage_bps",
+                help="Adverse basis points added to buys / subtracted from sells.",
+            )
+        with cc2:
+            st.selectbox(
+                "Product", ["INTRA", "CNC"], key="bt_product",
+                help="INTRA (intraday) or CNC (delivery) — affects STT / stamp duty.",
+            )
+
     data_source = st.session_state.get("data_source", "Yahoo Finance")
     tab_fetch, tab_csv = st.tabs([f"Fetch from {data_source}", "Upload CSV"])
 
@@ -645,8 +665,17 @@ def page_backtest() -> None:
 
 def _run_and_display_backtest(all_bars: dict[str, list]) -> None:
     strategy = SmaDemoMulti(short_period=5, long_period=20, qty=1)
+
+    apply_costs = st.session_state.get("bt_apply_costs", True)
+    if apply_costs:
+        costs = TradingCosts(slippage_pct=st.session_state.get("bt_slippage_bps", 5.0) / 10000.0)
+        product = st.session_state.get("bt_product", "INTRA")
+    else:
+        costs = None
+        product = None
+
     with st.spinner("Running backtest..."):
-        result = run_backtest(strategy, all_bars)
+        result = run_backtest(strategy, all_bars, costs=costs, cost_product=product)
 
     with st.container(border=True):
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -655,7 +684,18 @@ def _run_and_display_backtest(all_bars: dict[str, list]) -> None:
         c3.metric("Sells", result.sell_count)
         c4.metric("Realized", f"{result.pnl:,.0f}")
         c5.metric("Unrealized", f"{result.unrealized_pnl:,.0f}")
-        c6.metric("Net P&L", f"{result.pnl + result.unrealized_pnl:,.0f}")
+        gross = result.pnl + result.unrealized_pnl
+        c6.metric(
+            "Net P&L", f"{result.net_pnl:,.0f}",
+            delta=f"-{result.total_costs:,.0f} cost" if result.total_costs else None,
+            delta_color="inverse",
+        )
+
+    if apply_costs:
+        st.caption(
+            f"Gross P&L {gross:,.0f}  −  Costs {result.total_costs:,.2f}  "
+            f"=  Net {result.net_pnl:,.0f}"
+        )
 
     if result.positions:
         with st.expander("Open positions"):

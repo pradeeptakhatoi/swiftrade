@@ -51,6 +51,9 @@ def _build_parser() -> argparse.ArgumentParser:
     bt_p.add_argument("--to", dest="to_date", default=None, help="End date (YYYY-MM-DD)")
     bt_p.add_argument("--interval", default="day", choices=["day", "minute"])
     bt_p.add_argument("--csv", dest="csv_path", default=None, help="CSV file path instead of API")
+    bt_p.add_argument("--gross", action="store_true", help="Frictionless run (no costs/slippage)")
+    bt_p.add_argument("--slippage-bps", type=float, default=5.0, help="Adverse slippage in basis points")
+    bt_p.add_argument("--product", default="INTRA", choices=["INTRA", "CNC"], help="Product for cost model")
 
     sub.add_parser("kill-switch", help="Activate the Dhan kill switch")
 
@@ -144,6 +147,7 @@ def main(argv: list[str] | None = None) -> None:
 
     elif args.command == "backtest":
         from dhan_algo.backtest import (
+            TradingCosts,
             fetch_historical,
             load_csv,
             run_backtest,
@@ -172,7 +176,11 @@ def main(argv: list[str] | None = None) -> None:
         else:
             strategy = SmaDemoMulti()
 
-        result = run_backtest(strategy, bars, settings=settings)
+        costs = None if args.gross else TradingCosts(slippage_pct=args.slippage_bps / 10000.0)
+        result = run_backtest(
+            strategy, bars, settings=settings,
+            costs=costs, cost_product=args.product,
+        )
         print(result.summary())
 
     elif args.command == "kill-switch":

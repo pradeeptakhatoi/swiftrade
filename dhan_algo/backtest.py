@@ -43,6 +43,106 @@ class ReplayTicker:
 
 
 # ---------------------------------------------------------------------------
+# Trading costs — realistic Indian NSE equity friction model
+# ---------------------------------------------------------------------------
+
+
+def _is_intraday(product: str) -> bool:
+    return product.upper() in ("INTRA", "INTRADAY", "MIS")
+
+
+@dataclass
+class TradingCosts:
+    """Realistic transaction-cost and slippage model for NSE equity.
+
+    Defaults approximate a discount broker on NSE cash equity (rates current
+    as of 2024/2025). All ``*_pct`` values are fractions of turnover (price ×
+    qty), applied per executed order. Costs are intentionally on the
+    conservative side — a backtest that ignores friction is fiction.
+
+    Charge components (per order):
+      - Brokerage: ``min(brokerage_flat, brokerage_pct × turnover)``.
+      - STT: intraday charges the sell side only; delivery charges both sides.
+      - Exchange transaction charge, SEBI turnover fee: both sides.
+      - Stamp duty: buy side only (higher for delivery).
+      - GST: applied on (brokerage + exchange charge + SEBI fee).
+
+    Slippage is applied adversely to the fill price: buys fill higher, sells
+    fill lower, by ``slippage_pct`` of price.
+    """
+
+    # Adverse slippage as a fraction of price (5 bps = 0.0005).
+    slippage_pct: float = 0.0005
+
+    # Brokerage (per executed order).
+    brokerage_flat: float = 20.0
+    brokerage_pct: float = 0.0003  # 0.03% of turnover
+
+    # Securities Transaction Tax.
+    stt_delivery: float = 0.001        # 0.1% both sides
+    stt_intraday_sell: float = 0.00025  # 0.025% sell side only
+
+    # Regulatory / exchange charges (both sides).
+    exchange_txn_pct: float = 0.0000297  # NSE ~0.00297%
+    sebi_pct: float = 0.000001           # Rs 10 per crore
+
+    # Stamp duty (buy side only).
+    stamp_duty_delivery: float = 0.00015  # 0.015%
+    stamp_duty_intraday: float = 0.00003  # 0.003%
+
+    # Goods & Services Tax on brokerage + exchange + SEBI charges.
+    gst_pct: float = 0.18
+
+    def slippage_price(self, side: str, price: float) -> float:
+        """Return the fill price after adverse slippage."""
+        adj = price * self.slippage_pct
+        return price + adj if side.upper() == "BUY" else price - adj
+
+    def brokerage(self, turnover: float) -> float:
+        return min(self.brokerage_flat, self.brokerage_pct * turnover)
+
+    def breakdown(
+        self, side: str, price: float, qty: int, product: str = "INTRA"
+    ) -> dict[str, float]:
+        """Itemised charges for a single executed order."""
+        side_u = side.upper()
+        turnover = price * qty
+        intraday = _is_intraday(product)
+
+        brokerage = self.brokerage(turnover)
+        if intraday:
+            stt = self.stt_intraday_sell * turnover if side_u == "SELL" else 0.0
+        else:
+            stt = self.stt_delivery * turnover
+        exchange = self.exchange_txn_pct * turnover
+        sebi = self.sebi_pct * turnover
+        if side_u == "BUY":
+            stamp_duty = (
+                self.stamp_duty_intraday if intraday else self.stamp_duty_delivery
+            ) * turnover
+        else:
+            stamp_duty = 0.0
+        gst = self.gst_pct * (brokerage + exchange + sebi)
+
+        total = brokerage + stt + exchange + sebi + stamp_duty + gst
+        return {
+            "brokerage": brokerage,
+            "stt": stt,
+            "exchange": exchange,
+            "sebi": sebi,
+            "stamp_duty": stamp_duty,
+            "gst": gst,
+            "total": total,
+        }
+
+    def total(
+        self, side: str, price: float, qty: int, product: str = "INTRA"
+    ) -> float:
+        """Total charges for a single executed order."""
+        return self.breakdown(side, price, qty, product)["total"]
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -55,6 +155,7 @@ class SimulatedFill:
     qty: int
     price: float
     notional: float
+    cost: float = 0.0
 
 
 @dataclass
@@ -66,6 +167,12 @@ class BacktestResult:
     total_trades: int = 0
     buy_count: int = 0
     sell_count: int = 0
+    total_costs: float = 0.0
+
+    @property
+    def net_pnl(self) -> float:
+        """P&L after transaction costs (slippage is already in fill prices)."""
+        return self.pnl + self.unrealized_pnl - self.total_costs
 
     def summary(self) -> str:
         lines = [
@@ -75,7 +182,8 @@ class BacktestResult:
             f"Sells        : {self.sell_count}",
             f"Realized P&L : {self.pnl:,.2f}",
             f"Unrealized   : {self.unrealized_pnl:,.2f}",
-            f"Net P&L      : {self.pnl + self.unrealized_pnl:,.2f}",
+            f"Costs        : {self.total_costs:,.2f}",
+            f"Net P&L      : {self.net_pnl:,.2f}",
             f"Positions    : {self.positions}",
         ]
         return "\n".join(lines)
@@ -168,12 +276,22 @@ def run_backtest(
     strategy: MultiStrategy | Strategy,
     bars: dict[str, list[dict[str, Any]]],
     settings: Settings | None = None,
+    costs: TradingCosts | None = None,
+    cost_product: str | None = None,
 ) -> BacktestResult:
     """Replay historical bars through *strategy* and return a ``BacktestResult``.
 
     If *strategy* is a legacy ``Strategy``, it is wrapped automatically via
     ``_StrategyAdapter`` and ``ltp()`` is monkey-patched to read from the
     replay ticker so that ``SmaDemo.evaluate()`` works unchanged.
+
+    If *costs* is provided, fills are priced with adverse slippage and each
+    executed order is charged the itemised transaction costs (brokerage, STT,
+    exchange/SEBI fees, stamp duty, GST). When *costs* is ``None`` the backtest
+    is frictionless: fills occur at the bar close with zero cost.
+
+    *cost_product* overrides the product (``"INTRA"``/``"CNC"``) used for the
+    cost model; when ``None`` the order's own ``product`` is used.
     """
     settings = settings or get_settings()
     ticker = ReplayTicker()
@@ -224,26 +342,38 @@ def run_backtest(
 
             for order in orders:
                 order_sid = order.security_id or sid
-                notional = close * order.qty
 
-                # Risk guards
+                # Risk guards use the bar close (unslipped reference price).
+                ref_notional = close * order.qty
                 if order.qty > settings.max_qty:
                     logger.debug("Backtest: blocked qty %d > max %d", order.qty, settings.max_qty)
                     continue
-                if notional > settings.max_order_value:
-                    logger.debug("Backtest: blocked notional %.0f > max %.0f", notional, settings.max_order_value)
+                if ref_notional > settings.max_order_value:
+                    logger.debug("Backtest: blocked notional %.0f > max %.0f", ref_notional, settings.max_order_value)
                     continue
+
+                # Apply adverse slippage to the fill price, then charge costs.
+                if costs is not None:
+                    fill_price = costs.slippage_price(order.side, close)
+                    product = cost_product or getattr(order, "product", "INTRA")
+                    order_cost = costs.total(order.side, fill_price, order.qty, product)
+                else:
+                    fill_price = close
+                    order_cost = 0.0
+                notional = fill_price * order.qty
 
                 fill = SimulatedFill(
                     timestamp=timestamp,
                     security_id=order_sid,
                     side=order.side,
                     qty=order.qty,
-                    price=close,
+                    price=fill_price,
                     notional=notional,
+                    cost=order_cost,
                 )
                 result.fills.append(fill)
                 result.total_trades += 1
+                result.total_costs += order_cost
 
                 if order.side == "BUY":
                     result.buy_count += 1
@@ -257,7 +387,7 @@ def run_backtest(
                     prev_cost = cost_basis.get(order_sid, 0.0)
                     if prev_pos > 0:
                         avg_cost = prev_cost / prev_pos
-                        realized = (close - avg_cost) * min(order.qty, prev_pos)
+                        realized = (fill_price - avg_cost) * min(order.qty, prev_pos)
                         result.pnl += realized
                         sold_qty = min(order.qty, prev_pos)
                         positions[order_sid] = prev_pos - sold_qty
