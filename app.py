@@ -93,14 +93,23 @@ _install_log_handler()
 
 
 def _get_settings() -> Settings:
-    """Build Settings from session-state credentials (entered at login)."""
+    """Build Settings from session-state credentials (entered at login).
+
+    The dry-run / live-trading mode defaults to the ``DHAN_LIVE`` env var but
+    can be overridden at runtime via the sidebar toggle (session state key
+    ``live_trading``).
+    """
     creds = st.session_state.get("credentials", {})
-    return Settings(
+    settings = Settings(
         dhan_client_id=creds.get("client_id", ""),
         dhan_access_token=creds.get("access_token", ""),
         dhan_pin=creds.get("pin", ""),
         dhan_totp_secret=creds.get("totp_secret", ""),
     )
+    override = st.session_state.get("live_trading")
+    if override is not None:
+        settings.dhan_live = override
+    return settings
 
 
 def _get_client():
@@ -1347,14 +1356,23 @@ else:
             ),
         )
 
-        # Mode + risk limits packed into one compact block.
+        # Trading mode toggle. Seed from the DHAN_LIVE env value on first
+        # load, then let the user flip it; _get_settings() reads this key.
+        st.session_state.setdefault("live_trading", settings.dhan_live)
+        live = st.toggle(
+            "Live trading",
+            key="live_trading",
+            help="Off = dry run (no real orders). On = send real orders to Dhan.",
+        )
         with st.container(horizontal=True, vertical_alignment="center"):
-            if settings.dhan_live:
+            if live:
                 st.badge("LIVE", color="red", icon=":material/bolt:")
             else:
                 st.badge("DRY RUN", color="green", icon=":material/shield:")
             if st.session_state.get("strategy_running", False):
                 st.badge("Strategy running", color="blue")
+        if live:
+            st.warning("Real orders will be sent to your account.", icon=":material/warning:")
         st.caption(
             f"Qty ≤ {settings.max_qty}  ·  Value ≤ {settings.max_order_value:,.0f}  ·  "
             f"Loss ≤ {settings.max_daily_loss:,.0f}"
