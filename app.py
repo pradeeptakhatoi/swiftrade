@@ -92,12 +92,43 @@ _install_log_handler()
 # ---------------------------------------------------------------------------
 
 
+# Config fields the user may edit at runtime via the Settings page. These
+# default from the .env / built-in Settings values and are then overridable
+# per browser session without touching disk.
+EDITABLE_CONFIG_FIELDS = (
+    "max_qty",
+    "max_order_value",
+    "max_daily_loss",
+    "risk_per_trade",
+    "strategy_interval",
+    "log_level",
+    "journal_path",
+)
+
+
+def _config_store() -> dict:
+    """Session-persistent config overrides, seeded from .env / defaults."""
+    if "config" not in st.session_state:
+        base = Settings()
+        st.session_state["config"] = {
+            "max_qty": int(base.max_qty),
+            "max_order_value": float(base.max_order_value),
+            "max_daily_loss": float(base.max_daily_loss),
+            "risk_per_trade": float(base.risk_per_trade),
+            "strategy_interval": int(base.strategy_interval),
+            "log_level": base.log_level,
+            "journal_path": base.journal_path,
+        }
+    return st.session_state["config"]
+
+
 def _get_settings() -> Settings:
     """Build Settings from session-state credentials (entered at login).
 
     The dry-run / live-trading mode defaults to the ``DHAN_LIVE`` env var but
     can be overridden at runtime via the sidebar toggle (session state key
-    ``live_trading``).
+    ``live_trading``). Risk limits and runtime config are overridden from the
+    session config store edited on the Settings page.
     """
     creds = st.session_state.get("credentials", {})
     settings = Settings(
@@ -109,6 +140,11 @@ def _get_settings() -> Settings:
     override = st.session_state.get("live_trading")
     if override is not None:
         settings.dhan_live = override
+    cfg = st.session_state.get("config")
+    if cfg:
+        for field in EDITABLE_CONFIG_FIELDS:
+            if field in cfg:
+                setattr(settings, field, cfg[field])
     return settings
 
 
@@ -1491,6 +1527,94 @@ def page_tomorrow() -> None:
     )
 
 
+def page_settings() -> None:
+    st.caption("Settings — risk limits & runtime configuration")
+
+    cfg = _config_store()
+    levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
+    cur_level = str(cfg.get("log_level", "INFO")).upper()
+
+    with st.form("settings_form", border=True):
+        st.markdown("**Risk limits** — enforced before every order")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            max_qty = st.number_input(
+                "Max quantity / order", min_value=1, step=1,
+                value=int(cfg["max_qty"]),
+                help="Orders above this quantity are blocked.",
+            )
+        with c2:
+            max_order_value = st.number_input(
+                "Max order value (INR)", min_value=0.0, step=1000.0,
+                value=float(cfg["max_order_value"]),
+                help="Orders whose notional exceeds this are blocked.",
+            )
+        with c3:
+            max_daily_loss = st.number_input(
+                "Max daily loss (INR)", min_value=0.0, step=1000.0,
+                value=float(cfg["max_daily_loss"]),
+                help="Trading is halted once realised loss reaches this.",
+            )
+
+        st.markdown("**Position sizing & strategy**")
+        c4, c5 = st.columns(2)
+        with c4:
+            risk_per_trade = st.number_input(
+                "Risk per trade (INR)", min_value=0.0, step=100.0,
+                value=float(cfg["risk_per_trade"]),
+                help="Auto position-sizing budget. 0 = enter quantity manually.",
+            )
+        with c5:
+            strategy_interval = st.number_input(
+                "Strategy poll interval (s)", min_value=5, max_value=3600, step=5,
+                value=int(cfg["strategy_interval"]),
+            )
+
+        st.markdown("**Runtime**")
+        c6, c7 = st.columns(2)
+        with c6:
+            log_level = st.selectbox(
+                "Log level", levels,
+                index=levels.index(cur_level) if cur_level in levels else 1,
+            )
+        with c7:
+            journal_path = st.text_input(
+                "Trade journal file", value=cfg["journal_path"],
+                help="CSV path where order attempts are logged.",
+            )
+
+        col_save, col_reset = st.columns(2)
+        save = col_save.form_submit_button(
+            "Save settings", type="primary", width="stretch",
+        )
+        reset = col_reset.form_submit_button("Reset to defaults", width="stretch")
+
+    if save:
+        cfg.update({
+            "max_qty": int(max_qty),
+            "max_order_value": float(max_order_value),
+            "max_daily_loss": float(max_daily_loss),
+            "risk_per_trade": float(risk_per_trade),
+            "strategy_interval": int(strategy_interval),
+            "log_level": log_level,
+            "journal_path": journal_path.strip() or "trades.csv",
+        })
+        logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
+        st.success("Settings saved for this session.")
+        st.rerun()
+
+    if reset:
+        st.session_state.pop("config", None)
+        logging.getLogger().setLevel(logging.DEBUG)
+        st.success("Settings reset to .env / built-in defaults.")
+        st.rerun()
+
+    st.caption(
+        "Changes apply immediately to this browser session. To persist them, "
+        "set the matching variables in your `.env` file."
+    )
+
+
 # ---------------------------------------------------------------------------
 # App layout
 # ---------------------------------------------------------------------------
@@ -1506,6 +1630,7 @@ PAGES = {
     "Strategy": page_strategy,
     "Backtest": page_backtest,
     "Trade Journal": page_journal,
+    "Settings": page_settings,
     "Kill Switch": page_kill_switch,
 }
 
