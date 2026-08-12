@@ -14,7 +14,7 @@ import streamlit as st
 from dhan_algo.config import Settings
 from dhan_algo.client import get_client, ok
 from dhan_algo.market_data import ltp
-from dhan_algo.orders import place
+from dhan_algo.orders import calculate_position_size, place, place_bracket, place_with_sl_target
 from dhan_algo.risk import kill_switch
 from dhan_algo.security_master import resolve_security_id
 from dhan_algo.strategy import Order, PollingTicker, SmaDemoMulti
@@ -907,10 +907,29 @@ def page_intraday() -> None:
         unsafe_allow_html=True,
     )
 
-    # Order form — LIMIT only, pre-filled entry / SL / target
+    # Order form — bracket order with position sizing
     st.markdown("---")
+
+    # Position sizing info
+    _entry_default = round(entry if entry > 0 else row["price"], 2)
+    _sl_default = round(sl, 2) if sl > 0 else round(row["price"] * 0.99, 2)
+    _risk_per_share = abs(_entry_default - _sl_default)
+
+    if settings.risk_per_trade > 0 and _risk_per_share > 0.01:
+        auto_qty = calculate_position_size(
+            _entry_default, _sl_default,
+            settings.risk_per_trade, settings.max_qty, settings.max_order_value,
+        )
+        st.caption(
+            f"Position sizing: risk {settings.risk_per_trade:.0f} INR / "
+            f"risk per share {_risk_per_share:.2f} = **{auto_qty} shares** "
+            f"(max qty: {settings.max_qty}, max value: {settings.max_order_value:,.0f})"
+        )
+    else:
+        auto_qty = 1
+
     with st.form("intra_order_form"):
-        st.markdown(f"**Place orders for {selected_ticker}** (Entry + SL + Target)")
+        st.markdown(f"**Place bracket order for {selected_ticker}** (Entry + SL + Target)")
         fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
         with fcol1:
             side = st.selectbox("Side", ["BUY", "SELL"], key="intra_side")
@@ -919,14 +938,14 @@ def page_intraday() -> None:
                 "Quantity",
                 min_value=1,
                 max_value=settings.max_qty,
-                value=1,
+                value=max(auto_qty, 1),
                 key="intra_qty",
             )
         with fcol3:
             entry_price = st.number_input(
                 "Entry Price",
                 min_value=0.01,
-                value=round(entry if entry > 0 else row["price"], 2),
+                value=_entry_default,
                 step=0.05,
                 key="intra_entry_price",
             )
@@ -934,7 +953,7 @@ def page_intraday() -> None:
             sl_price = st.number_input(
                 "Stop Loss",
                 min_value=0.01,
-                value=round(sl, 2) if sl > 0 else round(row["price"] * 0.99, 2),
+                value=_sl_default,
                 step=0.05,
                 key="intra_sl_price",
             )
@@ -947,7 +966,7 @@ def page_intraday() -> None:
                 key="intra_target_price",
             )
 
-        submitted = st.form_submit_button("Place Orders", type="primary")
+        submitted = st.form_submit_button("Place Bracket Order", type="primary")
 
     if submitted:
         try:
@@ -957,60 +976,28 @@ def page_intraday() -> None:
                 st.error(f"Could not resolve symbol: {selected_ticker}")
                 return
 
-            exit_side = "SELL" if side == "BUY" else "BUY"
-
-            # 1. Entry order (LIMIT)
-            entry_result = place(
+            result = place_bracket(
                 client, sid,
                 side=side, qty=qty,
-                order_type="LIMIT", product="INTRA",
-                price=entry_price,
+                entry_price=entry_price,
+                stop_loss_price=sl_price,
+                target_price=target_price,
+                settings=settings,
             )
-            if entry_result is None:
-                st.error("Entry order blocked by risk guards.")
-            elif entry_result.get("status") == "dry_run":
-                st.info(f"[DRY RUN] Entry: {entry_result.get('plan', '')}")
-            elif ok(entry_result):
-                st.success(f"Entry order placed: {entry_result}")
+            if result is None:
+                st.error("Order blocked by risk guards.")
+            elif result.get("status") == "dry_run":
+                st.info(f"[DRY RUN] {result.get('plan', '')}")
+            elif ok(result):
+                st.success("Bracket order placed: Entry + SL + Target in one order")
+                st.json(result)
             else:
-                st.error(f"Entry order failed: {entry_result}")
-
-            # 2. Stop-loss order (SL)
-            sl_result = place(
-                client, sid,
-                side=exit_side, qty=qty,
-                order_type="SL", product="INTRA",
-                price=sl_price, trigger_price=sl_price,
-            )
-            if sl_result is None:
-                st.error("SL order blocked by risk guards.")
-            elif sl_result.get("status") == "dry_run":
-                st.info(f"[DRY RUN] SL: {sl_result.get('plan', '')}")
-            elif ok(sl_result):
-                st.success(f"SL order placed: {sl_result}")
-            else:
-                st.error(f"SL order failed: {sl_result}")
-
-            # 3. Target order (LIMIT)
-            tgt_result = place(
-                client, sid,
-                side=exit_side, qty=qty,
-                order_type="LIMIT", product="INTRA",
-                price=target_price,
-            )
-            if tgt_result is None:
-                st.error("Target order blocked by risk guards.")
-            elif tgt_result.get("status") == "dry_run":
-                st.info(f"[DRY RUN] Target: {tgt_result.get('plan', '')}")
-            elif ok(tgt_result):
-                st.success(f"Target order placed: {tgt_result}")
-            else:
-                st.error(f"Target order failed: {tgt_result}")
+                st.error(f"Bracket order failed: {result}")
 
         except SystemExit as e:
             st.warning(f"Client not configured: {e}")
         except Exception as e:
-            st.error(f"Error placing orders: {e}")
+            st.error(f"Error placing order: {e}")
 
 
 def page_swing() -> None:
@@ -1199,28 +1186,60 @@ def page_swing() -> None:
     with col_i4:
         st.metric("ATR %", f"{row.get('atr_pct', 0):.2f}%")
 
-    # Order form
+    # Order form — with SL, target, and position sizing
     st.markdown("---")
+
+    _sw_entry_default = round(row.get("entry", row["price"]), 2)
+    _sw_sl_default = round(row.get("stop_loss", row["price"] * 0.97), 2)
+    _sw_risk_per_share = abs(_sw_entry_default - _sw_sl_default)
+
+    if settings.risk_per_trade > 0 and _sw_risk_per_share > 0.01:
+        sw_auto_qty = calculate_position_size(
+            _sw_entry_default, _sw_sl_default,
+            settings.risk_per_trade, settings.max_qty, settings.max_order_value,
+        )
+        st.caption(
+            f"Position sizing: risk {settings.risk_per_trade:.0f} INR / "
+            f"risk per share {_sw_risk_per_share:.2f} = **{sw_auto_qty} shares** "
+            f"(max qty: {settings.max_qty}, max value: {settings.max_order_value:,.0f})"
+        )
+    else:
+        sw_auto_qty = 1
+
     with st.form("swing_order_form"):
-        st.markdown(f"**Place order for {selected_ticker}**")
+        st.markdown(f"**Place order for {selected_ticker}** (Entry + SL + Target)")
         ocol1, ocol2 = st.columns(2)
         with ocol1:
             side = st.selectbox("Side", ["BUY", "SELL"], key="sw_side")
             qty = st.number_input(
                 "Quantity", min_value=1, max_value=settings.max_qty,
-                value=1, key="sw_qty",
+                value=max(sw_auto_qty, 1), key="sw_qty",
             )
+            order_type = st.selectbox("Order Type", ["LIMIT", "MARKET"], key="sw_otype")
         with ocol2:
-            order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"], key="sw_otype")
             product = st.selectbox("Product", ["CNC", "INTRA"], key="sw_product",
                                    help="CNC for delivery (swing), INTRA for same-day")
             limit_price = st.number_input(
-                "Limit Price", min_value=0.0,
-                value=round(row.get("entry", row["price"]), 2),
+                "Entry Price", min_value=0.0,
+                value=_sw_entry_default,
                 step=0.05, key="sw_price",
             )
 
-        submitted = st.form_submit_button("Place Order", type="primary")
+        scol1, scol2 = st.columns(2)
+        with scol1:
+            sw_sl = st.number_input(
+                "Stop Loss", min_value=0.0,
+                value=_sw_sl_default,
+                step=0.05, key="sw_sl_price",
+            )
+        with scol2:
+            sw_target = st.number_input(
+                "Target", min_value=0.0,
+                value=round(row.get("target1", row["price"] * 1.05), 2),
+                step=0.05, key="sw_target_price",
+            )
+
+        submitted = st.form_submit_button("Place Order (Entry + SL + Target)", type="primary")
 
     if submitted:
         try:
@@ -1230,20 +1249,43 @@ def page_swing() -> None:
                 st.error(f"Could not resolve symbol: {selected_ticker}")
                 return
 
-            result = place(
-                client, sid,
-                side=side, qty=qty,
-                order_type=order_type, product=product,
-                price=limit_price if order_type == "LIMIT" else 0.0,
-            )
-            if result is None:
-                st.error("Order blocked by risk guards. Check logs for details.")
-            elif result.get("status") == "dry_run":
-                st.info(f"[DRY RUN] {result.get('plan', '')}")
-            elif ok(result):
-                st.success(f"Order placed successfully: {result}")
+            if product == "INTRA":
+                result = place_bracket(
+                    client, sid,
+                    side=side, qty=qty,
+                    entry_price=limit_price if order_type == "LIMIT" else 0.0,
+                    stop_loss_price=sw_sl,
+                    target_price=sw_target,
+                    settings=settings,
+                )
+                if result is None:
+                    st.error("Order blocked by risk guards.")
+                elif result.get("status") == "dry_run":
+                    st.info(f"[DRY RUN] {result.get('plan', '')}")
+                elif ok(result):
+                    st.success("Bracket order placed: Entry + SL + Target in one order")
+                    st.json(result)
+                else:
+                    st.error(f"Bracket order failed: {result}")
             else:
-                st.error(f"Order failed: {result}")
+                result = place_with_sl_target(
+                    client, sid,
+                    side=side, qty=qty,
+                    entry_price=limit_price if order_type == "LIMIT" else 0.0,
+                    stop_loss_price=sw_sl,
+                    target_price=sw_target,
+                    order_type=order_type, product=product,
+                    settings=settings,
+                )
+                for leg, resp in result.items():
+                    if resp is None:
+                        st.error(f"{leg.replace('_', ' ').title()} order blocked by risk guards.")
+                    elif resp.get("status") == "dry_run":
+                        st.info(f"[DRY RUN] {leg.replace('_', ' ').title()}: {resp.get('plan', '')}")
+                    elif ok(resp):
+                        st.success(f"{leg.replace('_', ' ').title()} order placed: {resp}")
+                    else:
+                        st.error(f"{leg.replace('_', ' ').title()} order failed: {resp}")
         except SystemExit as e:
             st.warning(f"Client not configured: {e}")
         except Exception as e:

@@ -16,6 +16,7 @@ def test_settings() -> Settings:
         max_qty=50,
         max_order_value=50_000,
         max_daily_loss=10_000,
+        risk_per_trade=0.0,
         strategy_interval=60,
         log_level="DEBUG",
         journal_path="test_trades.csv",
@@ -30,6 +31,8 @@ def mock_client() -> MagicMock:
     client.SELL = "SELL"
     client.MARKET = "MARKET"
     client.LIMIT = "LIMIT"
+    client.SL = "STOP_LOSS"
+    client.SLM = "STOP_LOSS_MARKET"
     client.INTRA = "INTRADAY"
     client.CNC = "CNC"
     return client

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     max_daily_loss: float = 10_000
     strategy_interval: int = 60
     log_level: str = "INFO"
+    risk_per_trade: float = 0  # INR risk per trade; 0 = manual qty
     journal_path: str = "trades.csv"
     feed_mode: str = "poll"
 

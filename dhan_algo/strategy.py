@@ -14,7 +14,7 @@ from dhanhq import dhanhq
 
 from dhan_algo.config import Settings, get_settings
 from dhan_algo.market_data import ltp
-from dhan_algo.orders import place
+from dhan_algo.orders import place, place_bracket, place_with_sl_target
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,9 @@ class Order:
     product: str = "INTRA"
     price: float = 0.0
     security_id: str = ""
+    stop_loss: float = 0.0
+    target: float = 0.0
+    trailing_jump: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +85,43 @@ class Strategy(ABC):
         """Return an Order to place, or None to do nothing this tick."""
 
 
+def _dispatch_order(
+    client: dhanhq,
+    order: Order,
+    default_security_id: str,
+    segment: str | None,
+    settings: Settings,
+) -> dict | None:
+    """Route an Order through the appropriate placement function."""
+    sid = order.security_id or default_security_id
+    if order.stop_loss > 0 and order.target > 0:
+        if order.product.upper() in ("INTRA", "INTRADAY"):
+            return place_bracket(
+                client, sid,
+                side=order.side, qty=order.qty,
+                entry_price=order.price,
+                stop_loss_price=order.stop_loss,
+                target_price=order.target,
+                trailing_jump=order.trailing_jump,
+                segment=segment, settings=settings,
+            )
+        return place_with_sl_target(
+            client, sid,
+            side=order.side, qty=order.qty,
+            entry_price=order.price,
+            stop_loss_price=order.stop_loss,
+            target_price=order.target,
+            order_type=order.order_type, product=order.product,
+            segment=segment, settings=settings,
+        )
+    return place(
+        client, sid,
+        side=order.side, qty=order.qty,
+        order_type=order.order_type, product=order.product,
+        price=order.price, segment=segment, settings=settings,
+    )
+
+
 def run_strategy_loop(
     strategy: Strategy,
     client: dhanhq,
@@ -100,17 +140,7 @@ def run_strategy_loop(
         while True:
             order = strategy.evaluate(client, security_id, segment)
             if order is not None:
-                place(
-                    client,
-                    security_id,
-                    side=order.side,
-                    qty=order.qty,
-                    order_type=order.order_type,
-                    product=order.product,
-                    price=order.price,
-                    segment=segment,
-                    settings=settings,
-                )
+                _dispatch_order(client, order, security_id, segment, settings)
             time.sleep(settings.strategy_interval)
     except KeyboardInterrupt:
         logger.info("Strategy loop stopped.")
@@ -274,12 +304,7 @@ def run_multi_strategy_loop(
             for sid in security_ids:
                 orders = strategy.on_tick(ticker, sid, segment)
                 for order in orders:
-                    place(
-                        client, order.security_id or sid,
-                        side=order.side, qty=order.qty,
-                        order_type=order.order_type, product=order.product,
-                        price=order.price, segment=segment, settings=settings,
-                    )
+                    _dispatch_order(client, order, sid, segment, settings)
             time.sleep(settings.strategy_interval)
     except KeyboardInterrupt:
         strategy.on_stop()
@@ -301,12 +326,7 @@ def run_ws_strategy_loop(
     def _on_tick(security_id: str, seg: str | None) -> None:
         orders = strategy.on_tick(ws_ticker, security_id, seg)
         for order in orders:
-            place(
-                client, order.security_id or security_id,
-                side=order.side, qty=order.qty,
-                order_type=order.order_type, product=order.product,
-                price=order.price, segment=seg, settings=settings,
-            )
+            _dispatch_order(client, order, security_id, seg, settings)
 
     ws_ticker = WebSocketTicker(client, security_ids, segment=segment, on_tick_callback=_on_tick)
     strategy.on_start(ws_ticker, security_ids)
