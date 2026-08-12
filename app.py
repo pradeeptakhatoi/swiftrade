@@ -285,24 +285,37 @@ def page_market_data() -> None:
 
     symbol = st.text_input("Symbol", value="RELIANCE", help="e.g. RELIANCE, TCS, INFY")
     auto_refresh = st.checkbox("Auto-refresh (every 5s)")
+    data_source = st.session_state.get("data_source", "Yahoo Finance")
 
     if symbol:
-        try:
-            client = _get_client()
-            sid = resolve_security_id(client, symbol)
-            if sid is None:
-                st.error(f"Could not resolve symbol: {symbol}")
-                return
-            st.caption(f"Security ID: {sid}")
-            price = ltp(client, sid)
-            if price is not None:
-                st.metric(f"{symbol.upper()} LTP", f"{price:,.2f} INR")
-            else:
-                st.warning("Could not fetch LTP.")
-        except SystemExit as e:
-            st.warning(f"Client not configured: {e}")
-        except Exception as e:
-            st.error(f"Error: {e}")
+        if data_source == "Yahoo Finance":
+            try:
+                ticker_yf = yf.Ticker(f"{symbol.upper()}.NS")
+                price = ticker_yf.fast_info.last_price
+                if price and price > 0:
+                    st.caption("Source: Yahoo Finance (15-min delayed)")
+                    st.metric(f"{symbol.upper()} LTP", f"{price:,.2f} INR")
+                else:
+                    st.warning("Could not fetch price from Yahoo Finance. Try Dhan API or check symbol.")
+            except Exception as e:
+                st.error(f"Yahoo Finance error: {e}")
+        else:
+            try:
+                client = _get_client()
+                sid = resolve_security_id(client, symbol)
+                if sid is None:
+                    st.error(f"Could not resolve symbol: {symbol}")
+                    return
+                st.caption(f"Source: Dhan API — Security ID: {sid}")
+                price = ltp(client, sid)
+                if price is not None:
+                    st.metric(f"{symbol.upper()} LTP", f"{price:,.2f} INR")
+                else:
+                    st.warning("Could not fetch LTP.")
+            except SystemExit as e:
+                st.warning(f"Client not configured: {e}")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
     if auto_refresh:
         time.sleep(5)
@@ -399,6 +412,8 @@ def page_positions_orders() -> None:
 def page_strategy() -> None:
     st.header("Strategy Runner")
     st.caption("SMA Crossover Demo — not investment advice")
+    if st.session_state.get("data_source", "Yahoo Finance") == "Yahoo Finance":
+        st.info("Strategy Runner always uses Dhan API for real-time price polling. Switch to Dhan API in the sidebar to remove this notice.")
 
     settings = _get_settings()
 
@@ -467,12 +482,30 @@ def page_strategy() -> None:
         st.rerun()
 
 
+def _yf_to_bars(df: pd.DataFrame, symbol: str) -> list[dict]:
+    """Convert a yfinance OHLCV DataFrame to the bar dict format used by run_backtest."""
+    bars = []
+    for _, row in df.iterrows():
+        ts = str(row.get("Datetime", row.get("Date", "")))
+        bars.append({
+            "timestamp": ts,
+            "security_id": symbol,
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": int(row.get("Volume", 0)),
+        })
+    return bars
+
+
 def page_backtest() -> None:
     st.header("Backtest")
 
-    tab_api, tab_csv = st.tabs(["Fetch from API", "Upload CSV"])
+    data_source = st.session_state.get("data_source", "Yahoo Finance")
+    tab_fetch, tab_csv = st.tabs([f"Fetch from {data_source}", "Upload CSV"])
 
-    with tab_api:
+    with tab_fetch:
         symbols_input = st.text_input("Symbols (comma-separated)", value="RELIANCE", key="bt_symbols")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -482,32 +515,70 @@ def page_backtest() -> None:
         with col3:
             interval = st.selectbox("Interval", ["day", "minute"], key="bt_interval")
 
-        if st.button("Run Backtest (API)", key="bt_api_run"):
+        if st.button(f"Run Backtest ({data_source})", key="bt_api_run"):
             symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
-            try:
-                client = _get_client()
-            except (SystemExit, Exception) as e:
-                st.error(f"Client error: {e}")
-                return
-
             all_bars: dict[str, list] = {}
-            with st.spinner("Fetching historical data..."):
-                for sym in symbols:
-                    sid = resolve_security_id(client, sym)
-                    if sid is None:
-                        st.error(f"Could not resolve: {sym}")
+
+            if data_source == "Yahoo Finance":
+                tickers_yf = [f"{sym}.NS" for sym in symbols]
+                yf_interval = "1d" if interval == "day" else "1m"
+                days_back = max((date.today() - from_date).days, 1)
+                period = f"{days_back}d" if days_back <= 730 else "2y"
+                with st.spinner("Fetching historical data from Yahoo Finance..."):
+                    try:
+                        df_all = yf.download(
+                            tickers_yf, period=period, interval=yf_interval,
+                            auto_adjust=True, group_by="ticker", threads=True,
+                        )
+                    except Exception as e:
+                        st.error(f"Yahoo Finance error: {e}")
                         return
-                    bars = fetch_historical(
-                        client,
-                        sid,
-                        from_date=str(from_date),
-                        to_date=str(to_date),
-                        interval=interval,
-                    )
-                    if bars:
-                        all_bars[sid] = bars
-                    else:
-                        st.warning(f"No data for {sym} ({sid})")
+
+                if df_all is None or df_all.empty:
+                    st.error("No data fetched from Yahoo Finance.")
+                    return
+
+                multi = isinstance(df_all.columns, pd.MultiIndex)
+                for sym in symbols:
+                    ticker_yf = f"{sym}.NS"
+                    try:
+                        df_bars = df_all[ticker_yf] if multi else df_all
+                        df_bars = df_bars.dropna(how="all").reset_index()
+                        for col in ("Open", "High", "Low", "Close", "Volume"):
+                            if col not in df_bars.columns:
+                                lc = col.lower()
+                                if lc in df_bars.columns:
+                                    df_bars.rename(columns={lc: col}, inplace=True)
+                        if len(df_bars) >= 2:
+                            all_bars[sym] = _yf_to_bars(df_bars, sym)
+                        else:
+                            st.warning(f"Not enough data for {sym}")
+                    except (KeyError, Exception) as e:
+                        st.warning(f"Skipped {sym}: {e}")
+            else:
+                try:
+                    client = _get_client()
+                except (SystemExit, Exception) as e:
+                    st.error(f"Client error: {e}")
+                    return
+
+                with st.spinner("Fetching historical data from Dhan API..."):
+                    for sym in symbols:
+                        sid = resolve_security_id(client, sym)
+                        if sid is None:
+                            st.error(f"Could not resolve: {sym}")
+                            return
+                        bars = fetch_historical(
+                            client,
+                            sid,
+                            from_date=str(from_date),
+                            to_date=str(to_date),
+                            interval=interval,
+                        )
+                        if bars:
+                            all_bars[sid] = bars
+                        else:
+                            st.warning(f"No data for {sym} ({sid})")
 
             if all_bars:
                 _run_and_display_backtest(all_bars)
@@ -802,39 +873,48 @@ def page_intraday() -> None:
     if row is None:
         return
 
-    # Trade setup display
-    col_setup1, col_setup2, col_setup3, col_setup4 = st.columns(4)
-    col_setup1.metric("Score", f"{row['score']:.1f}")
-    col_setup2.metric("Price", f"{row['price']:,.2f}")
-    col_setup3.metric("RSI(7)", f"{row.get('rsi7', 0):.1f}")
-    col_setup4.metric("Vol Ratio", f"{row.get('vol_ratio', 0):.2f}")
+    entry = row.get("entry", 0)
+    sl = row.get("stop_loss", 0)
+    t1 = row.get("target1", 0)
+    t2 = row.get("target2", 0)
+    st_dir = row.get("st_direction", 0)
+    above_orb = row.get("above_orb", 0)
 
-    col_t1, col_t2, col_t3, col_t4 = st.columns(4)
-    col_t1.metric("Entry", f"{row.get('entry', 0):,.2f}")
-    col_t2.metric("Stop Loss", f"{row.get('stop_loss', 0):,.2f}")
-    col_t3.metric("Target 1", f"{row.get('target1', 0):,.2f} (RR {row.get('rr1', 0)})")
-    col_t4.metric("Target 2", f"{row.get('target2', 0):,.2f} (RR {row.get('rr2', 0)})")
+    # Compact trade setup display
+    st.markdown(
+        f"""
+<table style="width:100%; font-size:0.82rem; line-height:1.8; border-collapse:collapse;">
+<tr style="border-bottom:1px solid #444;">
+  <td><b>Score:</b> {row['score']:.1f}</td>
+  <td><b>Price:</b> {row['price']:,.2f}</td>
+  <td><b>RSI(7):</b> {row.get('rsi7', 0):.1f}</td>
+  <td><b>Vol Ratio:</b> {row.get('vol_ratio', 0):.2f}</td>
+</tr>
+<tr style="border-bottom:1px solid #444;">
+  <td><b>VWAP:</b> {row.get('vwap', 0):,.2f} ({row.get('vwap_pct', 0):+.2f}%)</td>
+  <td><b>SuperTrend:</b> {"BULLISH" if st_dir == 1 else "BEARISH"}</td>
+  <td><b>ORB:</b> {"ABOVE" if above_orb == 1 else "INSIDE/BELOW"}</td>
+  <td><b>Change:</b> {row.get('change_pct', 0):+.2f}%</td>
+</tr>
+<tr>
+  <td><b>Entry:</b> {entry:,.2f}</td>
+  <td><b>Stop Loss:</b> {sl:,.2f}</td>
+  <td><b>Target 1:</b> {t1:,.2f} (RR {row.get('rr1', 0)})</td>
+  <td><b>Target 2:</b> {t2:,.2f} (RR {row.get('rr2', 0)})</td>
+</tr>
+</table>
+""",
+        unsafe_allow_html=True,
+    )
 
-    # Indicator summary
-    col_ind1, col_ind2, col_ind3 = st.columns(3)
-    with col_ind1:
-        vwap_val = row.get("vwap", 0)
-        vwap_pct = row.get("vwap_pct", 0)
-        st.metric("VWAP", f"{vwap_val:,.2f}", delta=f"{vwap_pct:+.2f}%")
-    with col_ind2:
-        st_dir = row.get("st_direction", 0)
-        st.metric("SuperTrend", "BULLISH" if st_dir == 1 else "BEARISH")
-    with col_ind3:
-        above = row.get("above_orb", 0)
-        st.metric("ORB Status", "ABOVE" if above == 1 else "INSIDE/BELOW")
-
-    # Order form
+    # Order form — LIMIT only, pre-filled entry / SL / target
     st.markdown("---")
     with st.form("intra_order_form"):
-        st.markdown(f"**Place order for {selected_ticker}**")
-        ocol1, ocol2 = st.columns(2)
-        with ocol1:
+        st.markdown(f"**Place orders for {selected_ticker}** (Entry + SL + Target)")
+        fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
+        with fcol1:
             side = st.selectbox("Side", ["BUY", "SELL"], key="intra_side")
+        with fcol2:
             qty = st.number_input(
                 "Quantity",
                 min_value=1,
@@ -842,18 +922,32 @@ def page_intraday() -> None:
                 value=1,
                 key="intra_qty",
             )
-        with ocol2:
-            order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"], key="intra_otype")
-            limit_price = st.number_input(
-                "Limit Price",
-                min_value=0.0,
-                value=round(row.get("entry", row["price"]), 2),
+        with fcol3:
+            entry_price = st.number_input(
+                "Entry Price",
+                min_value=0.01,
+                value=round(entry if entry > 0 else row["price"], 2),
                 step=0.05,
-                key="intra_price",
-                help="Used only for LIMIT orders",
+                key="intra_entry_price",
+            )
+        with fcol4:
+            sl_price = st.number_input(
+                "Stop Loss",
+                min_value=0.01,
+                value=round(sl, 2) if sl > 0 else round(row["price"] * 0.99, 2),
+                step=0.05,
+                key="intra_sl_price",
+            )
+        with fcol5:
+            target_price = st.number_input(
+                "Target",
+                min_value=0.01,
+                value=round(t1, 2) if t1 > 0 else round(row["price"] * 1.01, 2),
+                step=0.05,
+                key="intra_target_price",
             )
 
-        submitted = st.form_submit_button("Place Order", type="primary")
+        submitted = st.form_submit_button("Place Orders", type="primary")
 
     if submitted:
         try:
@@ -863,27 +957,60 @@ def page_intraday() -> None:
                 st.error(f"Could not resolve symbol: {selected_ticker}")
                 return
 
-            result = place(
-                client,
-                sid,
-                side=side,
-                qty=qty,
-                order_type=order_type,
-                product="INTRA",
-                price=limit_price if order_type == "LIMIT" else 0.0,
+            exit_side = "SELL" if side == "BUY" else "BUY"
+
+            # 1. Entry order (LIMIT)
+            entry_result = place(
+                client, sid,
+                side=side, qty=qty,
+                order_type="LIMIT", product="INTRA",
+                price=entry_price,
             )
-            if result is None:
-                st.error("Order blocked by risk guards. Check logs for details.")
-            elif result.get("status") == "dry_run":
-                st.info(f"[DRY RUN] {result.get('plan', '')}")
-            elif ok(result):
-                st.success(f"Order placed successfully: {result}")
+            if entry_result is None:
+                st.error("Entry order blocked by risk guards.")
+            elif entry_result.get("status") == "dry_run":
+                st.info(f"[DRY RUN] Entry: {entry_result.get('plan', '')}")
+            elif ok(entry_result):
+                st.success(f"Entry order placed: {entry_result}")
             else:
-                st.error(f"Order failed: {result}")
+                st.error(f"Entry order failed: {entry_result}")
+
+            # 2. Stop-loss order (SL)
+            sl_result = place(
+                client, sid,
+                side=exit_side, qty=qty,
+                order_type="SL", product="INTRA",
+                price=sl_price, trigger_price=sl_price,
+            )
+            if sl_result is None:
+                st.error("SL order blocked by risk guards.")
+            elif sl_result.get("status") == "dry_run":
+                st.info(f"[DRY RUN] SL: {sl_result.get('plan', '')}")
+            elif ok(sl_result):
+                st.success(f"SL order placed: {sl_result}")
+            else:
+                st.error(f"SL order failed: {sl_result}")
+
+            # 3. Target order (LIMIT)
+            tgt_result = place(
+                client, sid,
+                side=exit_side, qty=qty,
+                order_type="LIMIT", product="INTRA",
+                price=target_price,
+            )
+            if tgt_result is None:
+                st.error("Target order blocked by risk guards.")
+            elif tgt_result.get("status") == "dry_run":
+                st.info(f"[DRY RUN] Target: {tgt_result.get('plan', '')}")
+            elif ok(tgt_result):
+                st.success(f"Target order placed: {tgt_result}")
+            else:
+                st.error(f"Target order failed: {tgt_result}")
+
         except SystemExit as e:
             st.warning(f"Client not configured: {e}")
         except Exception as e:
-            st.error(f"Error placing order: {e}")
+            st.error(f"Error placing orders: {e}")
 
 
 def page_swing() -> None:
@@ -1157,6 +1284,18 @@ else:
         st.divider()
 
         page = st.radio("Navigation", list(PAGES.keys()))
+
+        st.divider()
+
+        st.radio(
+            "Data Source",
+            ["Yahoo Finance", "Dhan API"],
+            key="data_source",
+            help=(
+                "Yahoo Finance: free, ~15-min delayed, no login needed.\n"
+                "Dhan API: real-time, requires Dhan credentials."
+            ),
+        )
 
         st.divider()
 

@@ -1,6 +1,6 @@
-# dhan-algo
+# SwiftTrade
 
-Algorithmic trading toolkit for DhanHQ. DRY_RUN by default — no orders are sent unless you explicitly opt in.
+Algorithmic trading toolkit for the Indian stock market (NSE) using DhanHQ. Features a Streamlit web dashboard with swing and intraday scanners, a CLI for automation, backtesting, and built-in risk management. DRY_RUN by default — no orders are sent unless you explicitly opt in.
 
 ## Quick start
 
@@ -8,9 +8,24 @@ Algorithmic trading toolkit for DhanHQ. DRY_RUN by default — no orders are sen
 git clone <repo-url> && cd swiftrade
 pip install -e ".[dev]"
 cp .env.example .env
-# Edit .env with your credentials
+# Edit .env with your DhanHQ credentials
+```
+
+### Web dashboard (recommended)
+
+```bash
+streamlit run app.py
+```
+
+Open http://localhost:8501 in your browser.
+
+### CLI
+
+```bash
 dhan-algo --help
 ```
+
+See [docs/usage.md](docs/usage.md) for detailed usage instructions.
 
 ## Environment variables
 

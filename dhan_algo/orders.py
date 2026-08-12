@@ -23,6 +23,7 @@ def place(
     order_type: str = "MARKET",
     product: str = "INTRA",
     price: float = 0.0,
+    trigger_price: float = 0.0,
     segment: str | None = None,
     settings: Settings | None = None,
 ):
@@ -30,7 +31,17 @@ def place(
     settings = settings or get_settings()
     d_seg = segment or client.NSE
     txn = client.BUY if side.upper() == "BUY" else client.SELL
-    otype = client.MARKET if order_type.upper() == "MARKET" else client.LIMIT
+
+    ot = order_type.upper()
+    if ot == "MARKET":
+        otype = client.MARKET
+    elif ot in ("SL", "STOP_LOSS"):
+        otype = client.SL
+    elif ot in ("SL-M", "SL_MARKET"):
+        otype = client.SL_MARKET
+    else:
+        otype = client.LIMIT
+
     prod = client.INTRA if product.upper() in ("INTRA", "INTRADAY") else client.CNC
 
     # ---- risk guards ----
@@ -72,7 +83,7 @@ def place(
         )
         return {"status": "dry_run", "plan": plan}
 
-    resp = client.place_order(
+    order_kwargs = dict(
         security_id=str(security_id),
         exchange_segment=d_seg,
         transaction_type=txn,
@@ -81,6 +92,10 @@ def place(
         product_type=prod,
         price=float(price),
     )
+    if trigger_price > 0:
+        order_kwargs["trigger_price"] = float(trigger_price)
+
+    resp = client.place_order(**order_kwargs)
     if ok(resp):
         logger.info("PLACED: %s", resp)
         journal_record(
