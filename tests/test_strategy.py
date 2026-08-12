@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from dhan_algo.strategy import (
     MultiStrategy,
+    OrbBreakoutStrategy,
     Order,
     PollingTicker,
     SmaDemo,
@@ -199,3 +200,233 @@ class TestRunMultiStrategyLoop:
         mock_place.assert_called_once()
         call_kwargs = mock_place.call_args
         assert call_kwargs[0][1] == "2885"  # security_id
+
+
+# ---------------------------------------------------------------------------
+# OrbBreakoutStrategy
+# ---------------------------------------------------------------------------
+
+
+def _make_orb_strategy(**kwargs) -> OrbBreakoutStrategy:
+    """Create an OrbBreakoutStrategy with pre-loaded state (skip yfinance)."""
+    defaults = dict(
+        qty=10, interval_minutes=15, atr_multiplier=1.0,
+        min_volume_ratio=1.0, risk_per_trade=0,
+        symbol_map={"2885": "RELIANCE"},
+    )
+    defaults.update(kwargs)
+    strategy = OrbBreakoutStrategy(**defaults)
+    return strategy
+
+
+def _inject_state(strategy: OrbBreakoutStrategy, security_id: str, **overrides):
+    """Inject per-symbol state to avoid needing yfinance in tests."""
+    state = {
+        "symbol": "RELIANCE",
+        "orb_high": 2850.0,
+        "orb_low": 2800.0,
+        "atr": 20.0,
+        "st_direction": 1,
+        "vol_ratio": 1.5,
+        "long_traded": False,
+        "short_traded": False,
+    }
+    state.update(overrides)
+    strategy._state[security_id] = state
+
+
+class TestOrbBreakoutStrategy:
+    def test_long_breakout_signal(self):
+        """Price above orb_high with bullish ST + volume -> BUY order."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2855.0  # above orb_high=2850
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert len(orders) == 1
+        assert orders[0].side == "BUY"
+        assert orders[0].security_id == "2885"
+        assert orders[0].qty == 10
+
+    def test_short_breakout_signal(self):
+        """Price below orb_low with bearish ST + volume -> SELL order."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=-1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2795.0  # below orb_low=2800
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert len(orders) == 1
+        assert orders[0].side == "SELL"
+
+    def test_no_signal_inside_range(self):
+        """Price inside ORB range -> no orders."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885")
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2825.0  # between 2800 and 2850
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert orders == []
+
+    def test_no_duplicate_long_trade(self):
+        """Second breakout in same direction -> no order."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2855.0
+
+        orders1 = strategy.on_tick(ticker, "2885", None)
+        assert len(orders1) == 1
+
+        # Second tick still above ORB -> no new order
+        orders2 = strategy.on_tick(ticker, "2885", None)
+        assert orders2 == []
+
+    def test_no_duplicate_short_trade(self):
+        """Second short breakout -> no order."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=-1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2795.0
+
+        orders1 = strategy.on_tick(ticker, "2885", None)
+        assert len(orders1) == 1
+        orders2 = strategy.on_tick(ticker, "2885", None)
+        assert orders2 == []
+
+    def test_volume_filter_blocks(self):
+        """Low volume -> no order even on breakout."""
+        strategy = _make_orb_strategy(min_volume_ratio=1.5)
+        _inject_state(strategy, "2885", st_direction=1, vol_ratio=0.8)  # below min
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2855.0  # above orb_high
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert orders == []
+
+    def test_supertrend_filter_blocks_long(self):
+        """Bearish SuperTrend blocks long breakout."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=-1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2855.0  # above orb_high but ST bearish
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert orders == []
+
+    def test_supertrend_filter_blocks_short(self):
+        """Bullish SuperTrend blocks short breakout."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2795.0  # below orb_low but ST bullish
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert orders == []
+
+    def test_order_has_sl_and_target(self):
+        """Verify stop_loss and target are set on the Order."""
+        strategy = _make_orb_strategy(atr_multiplier=1.0)
+        _inject_state(strategy, "2885", atr=20.0, st_direction=1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2860.0
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert len(orders) == 1
+        order = orders[0]
+        # SL = entry - 1.0 * ATR = 2860 - 20 = 2840
+        assert order.stop_loss == 2840.0
+        # Target = entry + 2 * risk = 2860 + 40 = 2900
+        assert order.target == 2900.0
+        assert order.price == 2860.0
+
+    def test_short_order_has_correct_sl_target(self):
+        """Verify SL and target for short orders."""
+        strategy = _make_orb_strategy(atr_multiplier=1.0)
+        _inject_state(strategy, "2885", atr=20.0, st_direction=-1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 2790.0
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert len(orders) == 1
+        order = orders[0]
+        # SL = entry + 1.0 * ATR = 2790 + 20 = 2810
+        assert order.stop_loss == 2810.0
+        # Target = entry - 2 * risk = 2790 - 40 = 2750
+        assert order.target == 2750.0
+
+    def test_position_sizing_with_risk_per_trade(self, test_settings):
+        """When risk_per_trade is set, qty is calculated from ATR."""
+        strategy = _make_orb_strategy(
+            qty=1, risk_per_trade=500, atr_multiplier=1.0,
+            settings=test_settings,
+        )
+        # Low price so the risk-based sizing (not max_order_value) is the
+        # binding constraint: 50 * 810 = 40_500 < max_order_value (50_000).
+        _inject_state(
+            strategy, "2885",
+            orb_high=800.0, orb_low=750.0, atr=10.0,
+            st_direction=1, vol_ratio=1.5,
+        )
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 810.0  # above orb_high
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert len(orders) == 1
+        # risk = 1.0 * 10 = 10, qty = 500 / 10 = 50
+        assert orders[0].qty == 50
+
+    def test_no_signal_without_state(self):
+        """Symbol without initialised state returns no orders."""
+        strategy = _make_orb_strategy()
+        # Don't inject state for "9999"
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = 100.0
+
+        orders = strategy.on_tick(ticker, "9999", None)
+        assert orders == []
+
+    def test_no_signal_when_price_is_none(self):
+        """None LTP returns no orders."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885")
+
+        ticker = MagicMock()
+        ticker.get_ltp.return_value = None
+
+        orders = strategy.on_tick(ticker, "2885", None)
+        assert orders == []
+
+    def test_both_directions_can_trade(self):
+        """Long and short can both fire independently."""
+        strategy = _make_orb_strategy()
+        _inject_state(strategy, "2885", st_direction=1, vol_ratio=1.5)
+
+        ticker = MagicMock()
+
+        # Long breakout
+        ticker.get_ltp.return_value = 2855.0
+        long_orders = strategy.on_tick(ticker, "2885", None)
+        assert len(long_orders) == 1 and long_orders[0].side == "BUY"
+
+        # Switch SuperTrend to bearish for short
+        strategy._state["2885"]["st_direction"] = -1
+
+        # Short breakout
+        ticker.get_ltp.return_value = 2795.0
+        short_orders = strategy.on_tick(ticker, "2885", None)
+        assert len(short_orders) == 1 and short_orders[0].side == "SELL"

@@ -1,4 +1,4 @@
-"""Pluggable strategy hook with a polling loop and SMA demo."""
+"""Pluggable strategy hook with a polling loop, SMA demo, and ORB breakout."""
 
 from __future__ import annotations
 
@@ -10,11 +10,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+import pandas as pd
 from dhanhq import dhanhq
 
 from dhan_algo.config import Settings, get_settings
 from dhan_algo.market_data import ltp
-from dhan_algo.orders import place, place_bracket, place_with_sl_target
+from dhan_algo.orders import calculate_position_size, place, place_bracket, place_with_sl_target
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,172 @@ class SmaDemoMulti(MultiStrategy):
         delegate._prev_short = short_sma
         delegate._prev_long = long_sma
         return signal
+
+
+# ---------------------------------------------------------------------------
+# ORB Breakout strategy
+# ---------------------------------------------------------------------------
+
+
+class OrbBreakoutStrategy(MultiStrategy):
+    """Intraday ORB breakout with SuperTrend + volume confirmation.
+
+    On start, fetches today's intraday candles via yfinance and computes the
+    opening range, ATR, SuperTrend direction, and volume ratio.  On each tick,
+    checks whether the current price has broken above/below the ORB levels
+    with confirmation filters.  Generates bracket orders (entry + SL + target)
+    with ATR-based risk/reward.
+
+    Only one trade per direction per day to avoid whipsaws.
+    """
+
+    def __init__(
+        self,
+        qty: int = 1,
+        interval_minutes: int = 15,
+        atr_multiplier: float = 1.0,
+        min_volume_ratio: float = 1.0,
+        risk_per_trade: float = 0,
+        symbol_map: dict[str, str] | None = None,
+        settings: Settings | None = None,
+    ):
+        self.qty = qty
+        self.interval_minutes = interval_minutes
+        self.atr_multiplier = atr_multiplier
+        self.min_volume_ratio = min_volume_ratio
+        self.risk_per_trade = risk_per_trade
+        self._symbol_map = symbol_map or {}  # security_id -> ticker symbol
+        self._settings = settings
+        self._state: dict[str, dict] = {}
+
+    def on_start(self, ticker: Ticker, security_ids: list[str]) -> None:
+        """Fetch intraday data and compute ORB + indicators for each symbol."""
+        from indicators import compute_intraday
+
+        for sid in security_ids:
+            sym = self._symbol_map.get(sid)
+            if not sym:
+                logger.warning("[ORB] No symbol mapping for %s, skipping", sid)
+                continue
+            try:
+                import yfinance as yf
+
+                df = yf.download(
+                    f"{sym}.NS", period="5d",
+                    interval=f"{self.interval_minutes}m",
+                    auto_adjust=True, progress=False,
+                )
+                if df is None or df.empty:
+                    logger.warning("[ORB] No data for %s", sym)
+                    continue
+
+                df = df.reset_index()
+                # Normalise column names
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    if col not in df.columns:
+                        lc = col.lower()
+                        if lc in df.columns:
+                            df.rename(columns={lc: col}, inplace=True)
+
+                if len(df) < 10:
+                    logger.warning("[ORB] Too few bars for %s (%d)", sym, len(df))
+                    continue
+
+                df = compute_intraday(df, self.interval_minutes)
+                last = df.iloc[-1]
+
+                self._state[sid] = {
+                    "symbol": sym,
+                    "orb_high": float(df["orb_high"].iloc[-1]),
+                    "orb_low": float(df["orb_low"].iloc[-1]),
+                    "atr": float(df["atr7"].dropna().iloc[-1]),
+                    "st_direction": int(last.get("st_direction", 0)),
+                    "vol_ratio": float(last.get("vol_ratio", 0)),
+                    "long_traded": False,
+                    "short_traded": False,
+                }
+                st = self._state[sid]
+                logger.info(
+                    "[ORB] %s ready: ORB high=%.2f low=%.2f ATR=%.2f ST=%s vol=%.2f",
+                    sym, st["orb_high"], st["orb_low"], st["atr"],
+                    "BULL" if st["st_direction"] == 1 else "BEAR",
+                    st["vol_ratio"],
+                )
+            except Exception:
+                logger.exception("[ORB] Failed to initialise %s", sym)
+
+    def on_tick(self, ticker: Ticker, security_id: str, segment: str | None) -> list[Order]:
+        state = self._state.get(security_id)
+        if state is None:
+            return []
+
+        price = ticker.get_ltp(security_id, segment)
+        if price is None:
+            return []
+
+        orb_high = state["orb_high"]
+        orb_low = state["orb_low"]
+        atr = state["atr"]
+        st_dir = state["st_direction"]
+        vol_ratio = state["vol_ratio"]
+
+        # ---- LONG breakout ----
+        if (
+            not state["long_traded"]
+            and price > orb_high
+            and st_dir == 1
+            and vol_ratio >= self.min_volume_ratio
+        ):
+            risk = self.atr_multiplier * atr
+            sl = price - risk
+            target = price + 2 * risk  # 2:1 R:R
+
+            qty = self.qty
+            if self.risk_per_trade > 0 and risk > 0.01:
+                s = self._settings or get_settings()
+                qty = calculate_position_size(price, sl, self.risk_per_trade, s.max_qty, s.max_order_value)
+                qty = max(qty, 1)
+
+            state["long_traded"] = True
+            logger.info(
+                "[ORB] %s LONG breakout: entry=%.2f SL=%.2f target=%.2f qty=%d",
+                state["symbol"], price, sl, target, qty,
+            )
+            return [Order(
+                side="BUY", qty=qty, order_type="LIMIT", product="INTRA",
+                price=price, security_id=security_id,
+                stop_loss=sl, target=target,
+            )]
+
+        # ---- SHORT breakout ----
+        if (
+            not state["short_traded"]
+            and price < orb_low
+            and st_dir == -1
+            and vol_ratio >= self.min_volume_ratio
+        ):
+            risk = self.atr_multiplier * atr
+            sl = price + risk
+            target = price - 2 * risk  # 2:1 R:R
+
+            qty = self.qty
+            if self.risk_per_trade > 0 and risk > 0.01:
+                s = self._settings or get_settings()
+                qty = calculate_position_size(price, sl, self.risk_per_trade, s.max_qty, s.max_order_value)
+                qty = max(qty, 1)
+
+            state["short_traded"] = True
+            logger.info(
+                "[ORB] %s SHORT breakout: entry=%.2f SL=%.2f target=%.2f qty=%d",
+                state["symbol"], price, sl, target, qty,
+            )
+            return [Order(
+                side="SELL", qty=qty, order_type="LIMIT", product="INTRA",
+                price=price, security_id=security_id,
+                stop_loss=sl, target=target,
+            )]
+
+        return []
 
 
 def run_multi_strategy_loop(
