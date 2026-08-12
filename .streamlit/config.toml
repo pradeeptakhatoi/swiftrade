@@ -1,0 +1,7 @@
+[theme]
+# Compact defaults for dense, small-screen layouts.
+baseFontSize = 13
+headingFontSizes = ["22px", "18px", "15px", "14px", "13px", "12px"]
+headingFontWeights = [600, 600, 600, 500, 500, 500]
+baseRadius = "small"
+linkUnderline = false

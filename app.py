@@ -249,20 +249,47 @@ def _strategy_worker(
 # ---------------------------------------------------------------------------
 
 
+def _fund_metric_map(data: dict) -> list[tuple[str, str]]:
+    """Pick common fund fields for a compact metric row, falling back to raw keys."""
+    preferred = [
+        ("availabelBalance", "Available"),
+        ("availableBalance", "Available"),
+        ("sodLimit", "SOD limit"),
+        ("collateralAmount", "Collateral"),
+        ("utilizedAmount", "Utilized"),
+        ("withdrawableBalance", "Withdrawable"),
+    ]
+    picked: list[tuple[str, str]] = []
+    for key, label in preferred:
+        if key in data and data[key] is not None:
+            try:
+                picked.append((label, f"{float(data[key]):,.0f}"))
+            except (TypeError, ValueError):
+                picked.append((label, str(data[key])))
+    if not picked:
+        for k, v in list(data.items())[:4]:
+            picked.append((str(k), str(v)))
+    return picked[:4]
+
+
 def page_dashboard() -> None:
-    st.header("Dashboard")
     settings = _get_settings()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Account Funds")
+    col1, col2 = st.columns([3, 2])
+    with col1.container(border=True):
+        st.caption("Account funds")
         try:
             client = _get_client()
             resp = client.get_fund_limits()
             if ok(resp):
                 data = resp.get("data", {})
-                if isinstance(data, dict):
-                    st.json(data)
+                if isinstance(data, dict) and data:
+                    metrics = _fund_metric_map(data)
+                    mcols = st.columns(len(metrics))
+                    for mc, (label, value) in zip(mcols, metrics):
+                        mc.metric(label, value)
+                    with st.expander("Raw funds response"):
+                        st.json(data)
                 else:
                     st.write(data)
             else:
@@ -272,19 +299,20 @@ def page_dashboard() -> None:
         except Exception as e:
             st.error(f"Error fetching funds: {e}")
 
-    with col2:
-        st.subheader("Configuration")
-        st.metric("Max Qty", settings.max_qty)
-        st.metric("Max Order Value", f"{settings.max_order_value:,.0f} INR")
-        st.metric("Max Daily Loss", f"{settings.max_daily_loss:,.0f} INR")
-        st.metric("Strategy Interval", f"{settings.strategy_interval}s")
+    with col2.container(border=True):
+        st.caption("Risk configuration")
+        r1, r2 = st.columns(2)
+        r1.metric("Max qty", settings.max_qty)
+        r2.metric("Max order value", f"{settings.max_order_value:,.0f}")
+        r3, r4 = st.columns(2)
+        r3.metric("Max daily loss", f"{settings.max_daily_loss:,.0f}")
+        r4.metric("Strategy interval", f"{settings.strategy_interval}s")
 
 
 def page_market_data() -> None:
-    st.header("Market Data")
-
-    symbol = st.text_input("Symbol", value="RELIANCE", help="e.g. RELIANCE, TCS, INFY")
-    auto_refresh = st.checkbox("Auto-refresh (every 5s)")
+    mcol1, mcol2 = st.columns([3, 1], vertical_alignment="bottom")
+    symbol = mcol1.text_input("Symbol", value="RELIANCE", help="e.g. RELIANCE, TCS, INFY")
+    auto_refresh = mcol2.checkbox("Auto-refresh (5s)")
     data_source = st.session_state.get("data_source", "Yahoo Finance")
 
     if symbol:
@@ -323,20 +351,18 @@ def page_market_data() -> None:
 
 
 def page_place_order() -> None:
-    st.header("Place Order")
     settings = _get_settings()
 
-    with st.form("order_form"):
-        symbol = st.text_input("Symbol", value="RELIANCE")
-        col1, col2 = st.columns(2)
-        with col1:
-            side = st.selectbox("Side", ["BUY", "SELL"])
-            qty = st.number_input("Quantity", min_value=1, max_value=settings.max_qty, value=1)
-        with col2:
-            order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"])
-            product = st.selectbox("Product", ["INTRA", "CNC"])
-        price = st.number_input("Price (for LIMIT orders)", min_value=0.0, value=0.0, step=0.05)
-        submitted = st.form_submit_button("Place Order")
+    with st.form("order_form", border=True):
+        c1, c2, c3 = st.columns(3)
+        symbol = c1.text_input("Symbol", value="RELIANCE")
+        side = c2.selectbox("Side", ["BUY", "SELL"])
+        qty = c3.number_input("Qty", min_value=1, max_value=settings.max_qty, value=1)
+        c4, c5, c6 = st.columns(3)
+        order_type = c4.selectbox("Type", ["MARKET", "LIMIT"])
+        product = c5.selectbox("Product", ["INTRA", "CNC"])
+        price = c6.number_input("Price (LIMIT)", min_value=0.0, value=0.0, step=0.05)
+        submitted = st.form_submit_button("Place order", type="primary", width="stretch")
 
     if submitted:
         try:
@@ -369,8 +395,6 @@ def page_place_order() -> None:
 
 
 def page_positions_orders() -> None:
-    st.header("Positions & Orders")
-
     try:
         client = _get_client()
     except SystemExit as e:
@@ -380,97 +404,104 @@ def page_positions_orders() -> None:
         st.error(f"Error: {e}")
         return
 
-    st.subheader("Positions")
-    try:
-        resp = client.get_positions()
-        if ok(resp):
-            data = resp.get("data", [])
-            if data:
-                st.dataframe(pd.DataFrame(data), use_container_width=True)
-            else:
-                st.info("No open positions.")
-        else:
-            st.error(f"Could not fetch positions: {resp}")
-    except Exception as e:
-        st.error(f"Error fetching positions: {e}")
+    tab_pos, tab_ord = st.tabs(["Positions", "Orders"])
 
-    st.subheader("Orders")
-    try:
-        resp = client.get_order_list()
-        if ok(resp):
-            data = resp.get("data", [])
-            if data:
-                st.dataframe(pd.DataFrame(data), use_container_width=True)
+    with tab_pos:
+        try:
+            resp = client.get_positions()
+            if ok(resp):
+                data = resp.get("data", [])
+                if data:
+                    st.dataframe(pd.DataFrame(data), width="stretch", hide_index=True)
+                else:
+                    st.info("No open positions.")
             else:
-                st.info("No orders today.")
-        else:
-            st.error(f"Could not fetch orders: {resp}")
-    except Exception as e:
-        st.error(f"Error fetching orders: {e}")
+                st.error(f"Could not fetch positions: {resp}")
+        except Exception as e:
+            st.error(f"Error fetching positions: {e}")
+
+    with tab_ord:
+        try:
+            resp = client.get_order_list()
+            if ok(resp):
+                data = resp.get("data", [])
+                if data:
+                    st.dataframe(pd.DataFrame(data), width="stretch", hide_index=True)
+                else:
+                    st.info("No orders today.")
+            else:
+                st.error(f"Could not fetch orders: {resp}")
+        except Exception as e:
+            st.error(f"Error fetching orders: {e}")
 
 
 def page_strategy() -> None:
-    st.header("Strategy Runner")
-    st.caption("SMA Crossover Demo — not investment advice")
+    st.caption("SMA crossover demo — not investment advice. Uses Dhan API for real-time polling.")
     if st.session_state.get("data_source", "Yahoo Finance") == "Yahoo Finance":
-        st.info("Strategy Runner always uses Dhan API for real-time price polling. Switch to Dhan API in the sidebar to remove this notice.")
+        st.warning("Switch data source to Dhan API in the sidebar for live polling.", icon=":material/warning:")
 
     settings = _get_settings()
 
+    running = st.session_state.get("strategy_running", False)
+
     symbols_input = st.text_input("Symbols (comma-separated)", value="RELIANCE, INFY")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1], vertical_alignment="bottom")
     with col1:
         short_period = st.number_input("Short SMA", min_value=2, max_value=50, value=5)
     with col2:
         long_period = st.number_input("Long SMA", min_value=5, max_value=200, value=20)
     with col3:
         interval = st.number_input("Interval (s)", min_value=5, max_value=600, value=settings.strategy_interval)
+    with col4:
+        start_clicked = st.button(
+            "Start", disabled=running, type="primary", width="stretch",
+            icon=":material/play_arrow:",
+        )
+    with col5:
+        stop_clicked = st.button(
+            "Stop", disabled=not running, width="stretch",
+            icon=":material/stop:",
+        )
 
-    running = st.session_state.get("strategy_running", False)
+    if start_clicked:
+        try:
+            client = _get_client()
+        except (SystemExit, Exception) as e:
+            st.error(f"Client error: {e}")
+            return
 
-    col_start, col_stop = st.columns(2)
-    with col_start:
-        if st.button("Start Strategy", disabled=running, type="primary"):
-            try:
-                client = _get_client()
-            except (SystemExit, Exception) as e:
-                st.error(f"Client error: {e}")
+        symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+        security_ids = []
+        for sym in symbols:
+            sid = resolve_security_id(client, sym)
+            if sid is None:
+                st.error(f"Could not resolve: {sym}")
                 return
+            security_ids.append(sid)
 
-            symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
-            security_ids = []
-            for sym in symbols:
-                sid = resolve_security_id(client, sym)
-                if sid is None:
-                    st.error(f"Could not resolve: {sym}")
-                    return
-                security_ids.append(sid)
+        strategy = SmaDemoMulti(short_period=short_period, long_period=long_period, qty=1)
+        st.session_state.strategy_running = True
+        st.session_state.strategy_log = []
+        thread = threading.Thread(
+            target=_strategy_worker,
+            args=(client, security_ids, strategy, interval, None),
+            daemon=True,
+        )
+        thread.start()
+        st.session_state.strategy_thread = thread
+        st.rerun()
 
-            strategy = SmaDemoMulti(short_period=short_period, long_period=long_period, qty=1)
-            st.session_state.strategy_running = True
-            st.session_state.strategy_log = []
-            thread = threading.Thread(
-                target=_strategy_worker,
-                args=(client, security_ids, strategy, interval, None),
-                daemon=True,
-            )
-            thread.start()
-            st.session_state.strategy_thread = thread
-            st.rerun()
+    if stop_clicked:
+        st.session_state.strategy_running = False
+        st.rerun()
 
-    with col_stop:
-        if st.button("Stop Strategy", disabled=not running):
-            st.session_state.strategy_running = False
-            st.rerun()
-
-    # Status
+    # Status + live log
     if running:
-        st.success("Strategy is running...")
+        st.success("Strategy running", icon=":material/sensors:")
     else:
-        st.info("Strategy is stopped.")
+        st.info("Strategy stopped", icon=":material/pause:")
 
-    # Live log
-    st.subheader("Signal Log")
+    st.caption("Signal log")
     log_lines = st.session_state.get("strategy_log", [])
     if log_lines:
         st.code("\n".join(log_lines[-50:]), language="text")
@@ -500,7 +531,7 @@ def _yf_to_bars(df: pd.DataFrame, symbol: str) -> list[dict]:
 
 
 def page_backtest() -> None:
-    st.header("Backtest")
+    st.caption("Backtest — SMA crossover replay over historical data")
 
     data_source = st.session_state.get("data_source", "Yahoo Finance")
     tab_fetch, tab_csv = st.tabs([f"Fetch from {data_source}", "Upload CSV"])
@@ -608,29 +639,26 @@ def _run_and_display_backtest(all_bars: dict[str, list]) -> None:
     with st.spinner("Running backtest..."):
         result = run_backtest(strategy, all_bars)
 
-    st.subheader("Summary")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Trades", result.total_trades)
-    col2.metric("Buys", result.buy_count)
-    col3.metric("Sells", result.sell_count)
-    col4.metric("Net P&L", f"{result.pnl + result.unrealized_pnl:,.2f}")
-
-    col5, col6 = st.columns(2)
-    col5.metric("Realized P&L", f"{result.pnl:,.2f}")
-    col6.metric("Unrealized P&L", f"{result.unrealized_pnl:,.2f}")
+    with st.container(border=True):
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Trades", result.total_trades)
+        c2.metric("Buys", result.buy_count)
+        c3.metric("Sells", result.sell_count)
+        c4.metric("Realized", f"{result.pnl:,.0f}")
+        c5.metric("Unrealized", f"{result.unrealized_pnl:,.0f}")
+        c6.metric("Net P&L", f"{result.pnl + result.unrealized_pnl:,.0f}")
 
     if result.positions:
-        st.subheader("Open Positions")
-        st.json(result.positions)
+        with st.expander("Open positions"):
+            st.json(result.positions)
 
     if result.fills:
-        st.subheader("Fills")
+        st.caption("Fills")
         fills_data = [asdict(f) for f in result.fills]
-        st.dataframe(pd.DataFrame(fills_data), use_container_width=True)
+        st.dataframe(pd.DataFrame(fills_data), width="stretch", hide_index=True)
 
 
 def page_journal() -> None:
-    st.header("Trade Journal")
     settings = _get_settings()
 
     import os
@@ -653,13 +681,13 @@ def page_journal() -> None:
     with col1:
         if "status" in df.columns:
             statuses = ["All"] + sorted(df["status"].dropna().unique().tolist())
-            selected_status = st.selectbox("Filter by Status", statuses)
+            selected_status = st.selectbox("Status", statuses)
         else:
             selected_status = "All"
     with col2:
         if "side" in df.columns:
             sides = ["All"] + sorted(df["side"].dropna().unique().tolist())
-            selected_side = st.selectbox("Filter by Side", sides)
+            selected_side = st.selectbox("Side", sides)
         else:
             selected_side = "All"
 
@@ -669,15 +697,15 @@ def page_journal() -> None:
     if selected_side != "All":
         filtered = filtered[filtered["side"] == selected_side]
 
-    st.dataframe(filtered, use_container_width=True)
+    st.dataframe(filtered, width="stretch", hide_index=True)
     st.caption(f"{len(filtered)} of {len(df)} entries shown")
 
 
 def page_kill_switch() -> None:
-    st.header("Kill Switch")
     st.warning(
         "Activating the kill switch will **disable all trading** on your Dhan account "
-        "for the rest of the trading day. This action cannot be undone."
+        "for the rest of the trading day. This action cannot be undone.",
+        icon=":material/dangerous:",
     )
 
     if "kill_confirm" not in st.session_state:
@@ -711,65 +739,59 @@ def page_kill_switch() -> None:
                 st.rerun()
 
 
+def sidebar_intraday() -> None:
+    """Intraday scanner controls (rendered in the sidebar)."""
+    universe = st.selectbox(
+        "Universe",
+        ["NIFTY 50", "NIFTY 100", "Custom"],
+        key="intra_universe",
+        help="Pre-built universe or enter your own symbols",
+    )
+    if universe == "Custom":
+        st.text_input(
+            "Symbols (comma-separated)",
+            value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
+            key="intra_symbols",
+        )
+    else:
+        symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
+        st.session_state["intra_symbols"] = ", ".join(symbol_list)
+        st.caption(f"{len(symbol_list)} stocks")
+
+    st.segmented_control(
+        "Candle interval (min)", [1, 5, 15], default=15, key="intra_interval"
+    )
+
+    with st.expander("Scoring weights"):
+        st.slider("VWAP", 0.0, 5.0, 1.0, 0.5, key="w_vwap")
+        st.slider("SuperTrend", 0.0, 5.0, 1.0, 0.5, key="w_st")
+        st.slider("Momentum", 0.0, 5.0, 1.5, 0.5, key="w_mom")
+        st.slider("Volume", 0.0, 5.0, 0.5, 0.5, key="w_vol")
+        st.slider("ORB", 0.0, 5.0, 1.0, 0.5, key="w_orb")
+
+    st.session_state["intra_do_scan"] = st.button(
+        "Scan now", type="primary", key="intra_scan", width="stretch",
+        icon=":material/radar:",
+    )
+
+
 def page_intraday() -> None:
-    st.header("Intraday Scanner & Trade")
-    st.caption("Score stocks using VWAP, SuperTrend, Momentum, Volume & ORB — place orders from results")
+    st.caption("Intraday scanner — VWAP, SuperTrend, momentum, volume & ORB")
 
     settings = _get_settings()
 
-    # --- Configuration sidebar-like controls ---
-    col_uni, col_interval = st.columns([3, 1])
-    with col_uni:
-        universe = st.selectbox(
-            "Stock Universe",
-            ["NIFTY 50", "NIFTY 100", "Custom"],
-            key="intra_universe",
-            help="Pre-built universe or enter your own symbols",
-        )
-        if universe == "Custom":
-            symbols_input = st.text_input(
-                "Symbols (comma-separated)",
-                value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
-                key="intra_symbols",
-                help="Enter NSE symbols to scan",
-            )
-        else:
-            symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
-            symbols_input = ", ".join(symbol_list)
-            st.caption(f"{len(symbol_list)} stocks selected")
-    with col_interval:
-        interval_minutes = st.selectbox(
-            "Candle interval",
-            [1, 5, 15],
-            index=2,
-            key="intra_interval",
-            help="Intraday candle size in minutes",
-        )
-
-    # Weight sliders
-    with st.expander("Scoring Weights", expanded=False):
-        wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
-        with wcol1:
-            w_vwap = st.slider("VWAP", 0.0, 5.0, 1.0, 0.5, key="w_vwap")
-        with wcol2:
-            w_supertrend = st.slider("SuperTrend", 0.0, 5.0, 1.0, 0.5, key="w_st")
-        with wcol3:
-            w_momentum = st.slider("Momentum", 0.0, 5.0, 1.5, 0.5, key="w_mom")
-        with wcol4:
-            w_volume = st.slider("Volume", 0.0, 5.0, 0.5, 0.5, key="w_vol")
-        with wcol5:
-            w_orb = st.slider("ORB", 0.0, 5.0, 1.0, 0.5, key="w_orb")
-
+    symbols_input = st.session_state.get("intra_symbols", "RELIANCE, TCS, INFY, HDFCBANK, SBIN")
+    interval_minutes = st.session_state.get("intra_interval", 15) or 15
     weights = {
-        "vwap": w_vwap,
-        "supertrend": w_supertrend,
-        "momentum": w_momentum,
-        "volume": w_volume,
-        "orb": w_orb,
+        "vwap": st.session_state.get("w_vwap", 1.0),
+        "supertrend": st.session_state.get("w_st", 1.0),
+        "momentum": st.session_state.get("w_mom", 1.5),
+        "volume": st.session_state.get("w_vol", 0.5),
+        "orb": st.session_state.get("w_orb", 1.0),
     }
     params = {"interval_minutes": interval_minutes, "atr_multiplier": 1.0}
 
-    if st.button("Scan Now", type="primary", key="intra_scan"):
+    if st.session_state.get("intra_do_scan"):
         symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
         if not symbols:
             st.warning("Enter at least one symbol.")
@@ -830,7 +852,6 @@ def page_intraday() -> None:
         return
 
     # Summary table
-    st.subheader("Scored Results")
     display_cols = [
         "ticker", "name", "price", "change_pct", "score",
         "vwap_score", "supertrend_score", "momentum_score",
@@ -854,16 +875,12 @@ def page_intraday() -> None:
             return "background-color: #b71c1c; color: white"
 
     styled = df_display.style.map(_highlight_score, subset=["Score"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    # --- Detailed view + order placement ---
-    st.divider()
-    st.subheader("Trade Setup & Order Placement")
+    st.dataframe(styled, width="stretch", hide_index=True)
 
     # Symbol selector from scored results
     ticker_options = [r["ticker"] for r in results]
     selected_ticker = st.selectbox(
-        "Select symbol to trade",
+        "Symbol to trade",
         ticker_options,
         key="intra_trade_ticker",
     )
@@ -907,9 +924,6 @@ def page_intraday() -> None:
         unsafe_allow_html=True,
     )
 
-    # Order form — bracket order with position sizing
-    st.markdown("---")
-
     # Position sizing info
     _entry_default = round(entry if entry > 0 else row["price"], 2)
     _sl_default = round(sl, 2) if sl > 0 else round(row["price"] * 0.99, 2)
@@ -928,14 +942,14 @@ def page_intraday() -> None:
     else:
         auto_qty = 1
 
-    with st.form("intra_order_form"):
-        st.markdown(f"**Place bracket order for {selected_ticker}** (Entry + SL + Target)")
+    with st.form("intra_order_form", border=True):
+        st.caption(f"Bracket order for {selected_ticker} (entry + SL + target)")
         fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
         with fcol1:
             side = st.selectbox("Side", ["BUY", "SELL"], key="intra_side")
         with fcol2:
             qty = st.number_input(
-                "Quantity",
+                "Qty",
                 min_value=1,
                 max_value=settings.max_qty,
                 value=max(auto_qty, 1),
@@ -943,7 +957,7 @@ def page_intraday() -> None:
             )
         with fcol3:
             entry_price = st.number_input(
-                "Entry Price",
+                "Entry",
                 min_value=0.01,
                 value=_entry_default,
                 step=0.05,
@@ -951,7 +965,7 @@ def page_intraday() -> None:
             )
         with fcol4:
             sl_price = st.number_input(
-                "Stop Loss",
+                "Stop loss",
                 min_value=0.01,
                 value=_sl_default,
                 step=0.05,
@@ -966,7 +980,9 @@ def page_intraday() -> None:
                 key="intra_target_price",
             )
 
-        submitted = st.form_submit_button("Place Bracket Order", type="primary")
+        submitted = st.form_submit_button(
+            "Place bracket order", type="primary", width="stretch",
+        )
 
     if submitted:
         try:
@@ -1000,69 +1016,67 @@ def page_intraday() -> None:
             st.error(f"Error placing order: {e}")
 
 
-def page_swing() -> None:
-    st.header("Swing Scanner & Trade")
-    st.caption("Score stocks using Trend, Momentum, Volume, Breakout & Volatility — place orders from results")
-
-    settings = _get_settings()
-
+def sidebar_swing() -> None:
+    """Swing scanner controls (rendered in the sidebar)."""
     universe = st.selectbox(
-        "Stock Universe",
+        "Universe",
         ["NIFTY 50", "NIFTY 100", "Custom"],
         key="swing_universe",
         help="Pre-built universe or enter your own symbols",
     )
     if universe == "Custom":
-        symbols_input = st.text_input(
+        st.text_input(
             "Symbols (comma-separated)",
             value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
             key="swing_symbols",
         )
     else:
         symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
-        symbols_input = ", ".join(symbol_list)
-        st.caption(f"{len(symbol_list)} stocks selected")
+        st.session_state["swing_symbols"] = ", ".join(symbol_list)
+        st.caption(f"{len(symbol_list)} stocks")
 
-    # Weight sliders
-    with st.expander("Scoring Weights", expanded=False):
-        wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
-        with wcol1:
-            w_trend = st.slider("Trend", 0.0, 5.0, 1.0, 0.5, key="sw_trend")
-        with wcol2:
-            w_momentum = st.slider("Momentum", 0.0, 5.0, 1.0, 0.5, key="sw_mom")
-        with wcol3:
-            w_volume = st.slider("Volume", 0.0, 5.0, 0.8, 0.5, key="sw_vol")
-        with wcol4:
-            w_breakout = st.slider("Breakout", 0.0, 5.0, 0.8, 0.5, key="sw_brk")
-        with wcol5:
-            w_volatility = st.slider("Volatility", 0.0, 5.0, 0.5, 0.5, key="sw_vlt")
+    with st.expander("Scoring weights"):
+        st.slider("Trend", 0.0, 5.0, 1.0, 0.5, key="sw_trend")
+        st.slider("Momentum", 0.0, 5.0, 1.0, 0.5, key="sw_mom")
+        st.slider("Volume", 0.0, 5.0, 0.8, 0.5, key="sw_vol")
+        st.slider("Breakout", 0.0, 5.0, 0.8, 0.5, key="sw_brk")
+        st.slider("Volatility", 0.0, 5.0, 0.5, 0.5, key="sw_vlt")
 
-    with st.expander("Advanced Settings", expanded=False):
-        acol1, acol2 = st.columns(2)
-        with acol1:
-            atr_mult = st.number_input(
-                "Stop-loss ATR multiplier",
-                min_value=0.5, max_value=3.0, value=1.5, step=0.1,
-                key="sw_atr_mult",
-            )
-        with acol2:
-            lookback_days = st.number_input(
-                "History (trading days)",
-                min_value=250, max_value=500, value=365, step=10,
-                key="sw_lookback",
-                help="Number of calendar days of daily data to fetch",
-            )
+    with st.expander("Advanced"):
+        st.number_input(
+            "Stop-loss ATR multiplier",
+            min_value=0.5, max_value=3.0, value=1.5, step=0.1,
+            key="sw_atr_mult",
+        )
+        st.number_input(
+            "History (trading days)",
+            min_value=250, max_value=500, value=365, step=10,
+            key="sw_lookback",
+            help="Number of calendar days of daily data to fetch",
+        )
 
+    st.session_state["swing_do_scan"] = st.button(
+        "Scan now", type="primary", key="swing_scan", width="stretch",
+        icon=":material/radar:",
+    )
+
+
+def page_swing() -> None:
+    st.caption("Swing scanner — trend, momentum, volume, breakout & volatility")
+
+    settings = _get_settings()
+
+    symbols_input = st.session_state.get("swing_symbols", "RELIANCE, TCS, INFY, HDFCBANK, SBIN")
     weights = {
-        "trend": w_trend,
-        "momentum": w_momentum,
-        "volume": w_volume,
-        "breakout": w_breakout,
-        "volatility": w_volatility,
+        "trend": st.session_state.get("sw_trend", 1.0),
+        "momentum": st.session_state.get("sw_mom", 1.0),
+        "volume": st.session_state.get("sw_vol", 0.8),
+        "breakout": st.session_state.get("sw_brk", 0.8),
+        "volatility": st.session_state.get("sw_vlt", 0.5),
     }
-    params = {"atr_multiplier": atr_mult}
+    params = {"atr_multiplier": st.session_state.get("sw_atr_mult", 1.5)}
 
-    if st.button("Scan Now", type="primary", key="swing_scan"):
+    if st.session_state.get("swing_do_scan"):
         symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
         if not symbols:
             st.warning("Enter at least one symbol.")
@@ -1122,7 +1136,6 @@ def page_swing() -> None:
         return
 
     # Summary table
-    st.subheader("Scored Results")
     display_cols = [
         "ticker", "name", "price", "change_pct", "score",
         "trend_score", "momentum_score", "volume_score",
@@ -1145,15 +1158,11 @@ def page_swing() -> None:
             return "background-color: #b71c1c; color: white"
 
     styled = df_display.style.map(_highlight_score, subset=["Score"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    # --- Detailed view + order placement ---
-    st.divider()
-    st.subheader("Trade Setup & Order Placement")
+    st.dataframe(styled, width="stretch", hide_index=True)
 
     ticker_options = [r["ticker"] for r in results]
     selected_ticker = st.selectbox(
-        "Select symbol to trade",
+        "Symbol to trade",
         ticker_options,
         key="swing_trade_ticker",
     )
@@ -1162,32 +1171,25 @@ def page_swing() -> None:
     if row is None:
         return
 
-    # Trade setup display
-    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-    col_s1.metric("Score", f"{row['score']:.1f}")
-    col_s2.metric("Price", f"{row['price']:,.2f}")
-    col_s3.metric("RSI(14)", f"{row.get('rsi', 0):.1f}")
-    col_s4.metric("Vol Ratio", f"{row.get('vol_ratio', 0):.2f}")
+    # Compact trade setup: key stats + levels grouped in one bordered block.
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Score", f"{row['score']:.1f}")
+        c2.metric("Price", f"{row['price']:,.2f}")
+        c3.metric("RSI(14)", f"{row.get('rsi', 0):.1f}")
+        c4.metric("Vol ratio", f"{row.get('vol_ratio', 0):.2f}")
 
-    col_t1, col_t2, col_t3, col_t4 = st.columns(4)
-    col_t1.metric("Entry", f"{row.get('entry', 0):,.2f}")
-    col_t2.metric("Stop Loss", f"{row.get('stop_loss', 0):,.2f}")
-    col_t3.metric("Target 1", f"{row.get('target1', 0):,.2f} (RR {row.get('rr1', 0)})")
-    col_t4.metric("Target 2", f"{row.get('target2', 0):,.2f} (RR {row.get('rr2', 0)})")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Entry", f"{row.get('entry', 0):,.2f}")
+        c2.metric("Stop loss", f"{row.get('stop_loss', 0):,.2f}")
+        c3.metric("Target 1", f"{row.get('target1', 0):,.2f}", f"RR {row.get('rr1', 0)}")
+        c4.metric("Target 2", f"{row.get('target2', 0):,.2f}", f"RR {row.get('rr2', 0)}")
 
-    # Indicator summary
-    col_i1, col_i2, col_i3, col_i4 = st.columns(4)
-    with col_i1:
-        st.metric("52wk High %", f"{row.get('pct_from_52wk', 0):.1f}%")
-    with col_i2:
-        st.metric("MACD Hist", f"{row.get('macd_hist', 0):.4f}")
-    with col_i3:
-        st.metric("Bollinger %B", f"{row.get('pct_b', 0):.2f}")
-    with col_i4:
-        st.metric("ATR %", f"{row.get('atr_pct', 0):.2f}%")
-
-    # Order form — with SL, target, and position sizing
-    st.markdown("---")
+        st.caption(
+            f"52wk high {row.get('pct_from_52wk', 0):.1f}%  ·  "
+            f"MACD hist {row.get('macd_hist', 0):.4f}  ·  "
+            f"%B {row.get('pct_b', 0):.2f}  ·  ATR {row.get('atr_pct', 0):.2f}%"
+        )
 
     _sw_entry_default = round(row.get("entry", row["price"]), 2)
     _sw_sl_default = round(row.get("stop_loss", row["price"] * 0.97), 2)
@@ -1206,40 +1208,44 @@ def page_swing() -> None:
     else:
         sw_auto_qty = 1
 
-    with st.form("swing_order_form"):
-        st.markdown(f"**Place order for {selected_ticker}** (Entry + SL + Target)")
-        ocol1, ocol2 = st.columns(2)
-        with ocol1:
+    with st.form("swing_order_form", border=True):
+        st.caption(f"Place order for {selected_ticker} (entry + SL + target)")
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        with r1c1:
             side = st.selectbox("Side", ["BUY", "SELL"], key="sw_side")
-            qty = st.number_input(
-                "Quantity", min_value=1, max_value=settings.max_qty,
-                value=max(sw_auto_qty, 1), key="sw_qty",
-            )
-            order_type = st.selectbox("Order Type", ["LIMIT", "MARKET"], key="sw_otype")
-        with ocol2:
+        with r1c2:
+            order_type = st.selectbox("Type", ["LIMIT", "MARKET"], key="sw_otype")
+        with r1c3:
             product = st.selectbox("Product", ["CNC", "INTRA"], key="sw_product",
                                    help="CNC for delivery (swing), INTRA for same-day")
-            limit_price = st.number_input(
-                "Entry Price", min_value=0.0,
-                value=_sw_entry_default,
-                step=0.05, key="sw_price",
+        with r1c4:
+            qty = st.number_input(
+                "Qty", min_value=1, max_value=settings.max_qty,
+                value=max(sw_auto_qty, 1), key="sw_qty",
             )
 
-        scol1, scol2 = st.columns(2)
-        with scol1:
+        r2c1, r2c2, r2c3, r2c4 = st.columns([1, 1, 1, 1])
+        with r2c1:
+            limit_price = st.number_input(
+                "Entry", min_value=0.0, value=_sw_entry_default,
+                step=0.05, key="sw_price",
+            )
+        with r2c2:
             sw_sl = st.number_input(
-                "Stop Loss", min_value=0.0,
-                value=_sw_sl_default,
+                "Stop loss", min_value=0.0, value=_sw_sl_default,
                 step=0.05, key="sw_sl_price",
             )
-        with scol2:
+        with r2c3:
             sw_target = st.number_input(
                 "Target", min_value=0.0,
                 value=round(row.get("target1", row["price"] * 1.05), 2),
                 step=0.05, key="sw_target_price",
             )
-
-        submitted = st.form_submit_button("Place Order (Entry + SL + Target)", type="primary")
+        with r2c4:
+            st.write("")
+            submitted = st.form_submit_button(
+                "Place order", type="primary", width="stretch",
+            )
 
     if submitted:
         try:
@@ -1309,55 +1315,64 @@ PAGES = {
     "Kill Switch": page_kill_switch,
 }
 
-st.set_page_config(page_title="SwiftTrade", layout="wide")
+# Per-page controls rendered in the sidebar to keep the main area focused
+# on results and actions.
+SIDEBAR_CONTROLS = {
+    "Swing Scanner": sidebar_swing,
+    "Intraday Scanner": sidebar_intraday,
+}
+
+st.set_page_config(page_title="SwiftTrade", layout="wide", initial_sidebar_state="expanded")
 
 if not _is_logged_in():
     page_login()
 else:
-    # Sidebar
+    settings = _get_settings()
+    creds = st.session_state.get("credentials", {})
+
+    # Sidebar: navigation + global controls only (kept dense).
     with st.sidebar:
-        st.title("SwiftTrade")
-        creds = st.session_state.get("credentials", {})
-        st.caption(f"Client: {creds.get('client_id', '')}")
-        if st.button("Logout"):
-            _logout()
-            st.rerun()
+        page = st.radio(
+            "Navigation", list(PAGES.keys()), label_visibility="collapsed"
+        )
 
-        st.divider()
-
-        page = st.radio("Navigation", list(PAGES.keys()))
-
-        st.divider()
-
-        st.radio(
-            "Data Source",
+        st.segmented_control(
+            "Data source",
             ["Yahoo Finance", "Dhan API"],
             key="data_source",
+            default="Yahoo Finance",
             help=(
                 "Yahoo Finance: free, ~15-min delayed, no login needed.\n"
                 "Dhan API: real-time, requires Dhan credentials."
             ),
         )
 
-        st.divider()
+        # Mode + risk limits packed into one compact block.
+        with st.container(horizontal=True, vertical_alignment="center"):
+            if settings.dhan_live:
+                st.badge("LIVE", color="red", icon=":material/bolt:")
+            else:
+                st.badge("DRY RUN", color="green", icon=":material/shield:")
+            if st.session_state.get("strategy_running", False):
+                st.badge("Strategy running", color="blue")
+        st.caption(
+            f"Qty ≤ {settings.max_qty}  ·  Value ≤ {settings.max_order_value:,.0f}  ·  "
+            f"Loss ≤ {settings.max_daily_loss:,.0f}"
+        )
 
-        # Mode badge
-        settings = _get_settings()
-        if settings.dhan_live:
-            st.error("LIVE TRADING")
-        else:
-            st.success("DRY RUN")
+        # Contextual controls for the active page render here to keep the
+        # main area focused on results and actions.
+        sidebar_controls = SIDEBAR_CONTROLS.get(page)
+        if sidebar_controls is not None:
+            st.divider()
+            sidebar_controls()
 
-        st.caption(f"Max Qty: {settings.max_qty}")
-        st.caption(f"Max Order Value: {settings.max_order_value:,.0f}")
-        st.caption(f"Max Daily Loss: {settings.max_daily_loss:,.0f}")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption(f"Client {creds.get('client_id', '')}")
+            if st.button("Logout", icon=":material/logout:", width="stretch"):
+                _logout()
+                st.rerun()
 
-        # Strategy status
-        if st.session_state.get("strategy_running", False):
-            st.info("Strategy: Running")
-
-    # Render selected page
+    # Render selected page, then a collapsed logs expander.
     PAGES[page]()
-
-    # Logs at bottom of every page
     _show_logs()
