@@ -1347,12 +1347,157 @@ def page_swing() -> None:
             st.error(f"Error placing order: {e}")
 
 
+def sidebar_tomorrow() -> None:
+    """Tomorrow's Picks controls (rendered in the sidebar)."""
+    universe = st.selectbox(
+        "Universe",
+        ["NIFTY 100", "NIFTY 50"],
+        key="tm_universe",
+        help="Universe to scan for next-day swing candidates",
+    )
+    symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
+    st.caption(f"{len(symbol_list)} stocks")
+
+    st.slider("Show top", 5, 30, 10, 1, key="tm_top_n")
+    st.slider(
+        "Minimum score", 0, 100, 60, 5, key="tm_min_score",
+        help="Only list candidates scoring at or above this swing score",
+    )
+    st.number_input(
+        "Stop-loss ATR multiplier",
+        min_value=0.5, max_value=3.0, value=1.5, step=0.1,
+        key="tm_atr_mult",
+    )
+
+    st.session_state["tomorrow_do_scan"] = st.button(
+        "Find picks", type="primary", key="tomorrow_scan", width="stretch",
+        icon=":material/trending_up:",
+    )
+
+
+def page_tomorrow() -> None:
+    st.caption("Tomorrow's Picks — top-ranked swing candidates for next-day trading")
+
+    universe = st.session_state.get("tm_universe", "NIFTY 100")
+    symbols = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
+    top_n = int(st.session_state.get("tm_top_n", 10))
+    min_score = float(st.session_state.get("tm_min_score", 60))
+    weights = {
+        "trend": 1.0, "momentum": 1.0, "volume": 0.8,
+        "breakout": 0.8, "volatility": 0.5,
+    }
+    params = {"atr_multiplier": st.session_state.get("tm_atr_mult", 1.5)}
+
+    if st.session_state.get("tomorrow_do_scan"):
+        data: dict[str, pd.DataFrame] = {}
+        tickers_yf = [f"{sym}.NS" for sym in symbols]
+        with st.spinner(f"Fetching daily data for {len(symbols)} stocks..."):
+            try:
+                df_all = yf.download(
+                    tickers_yf, period="1y",
+                    auto_adjust=True, group_by="ticker", threads=True,
+                )
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+                return
+
+        if df_all is None or df_all.empty:
+            st.error("No data fetched.")
+            return
+
+        multi = isinstance(df_all.columns, pd.MultiIndex)
+        for sym in symbols:
+            ticker_yf = f"{sym}.NS"
+            try:
+                df_bars = df_all[ticker_yf] if multi else df_all
+                df_bars = df_bars.dropna(how="all").reset_index()
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    if col not in df_bars.columns:
+                        lc = col.lower()
+                        if lc in df_bars.columns:
+                            df_bars.rename(columns={lc: col}, inplace=True)
+                if len(df_bars) >= 220:
+                    data[sym] = df_bars
+            except (KeyError, Exception):
+                pass
+
+        if not data:
+            st.error("No data met the minimum bar requirement (220 daily bars).")
+            return
+
+        with st.spinner("Scoring universe..."):
+            results = score_universe(data, weights, params)
+
+        st.session_state["tomorrow_results"] = results
+        st.session_state["tomorrow_scanned"] = len(data)
+
+    results = st.session_state.get("tomorrow_results")
+    if not results:
+        st.info("Click **Find picks** to scan the universe and rank next-day candidates.")
+        return
+
+    picks = [r for r in results if r["score"] >= min_score][:top_n]
+    scanned = st.session_state.get("tomorrow_scanned", len(results))
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Scanned", scanned)
+        c2.metric(f"Picks (score ≥ {min_score:.0f})", len(picks))
+        c3.metric("Top score", f"{picks[0]['score']:.1f}" if picks else "—")
+
+    if not picks:
+        st.warning(
+            f"No candidates scored ≥ {min_score:.0f}. Lower the minimum score in the sidebar."
+        )
+        return
+
+    # Ranked list with entry/stop/target levels for each pick.
+    rows = []
+    for i, r in enumerate(picks, start=1):
+        rows.append({
+            "Rank": i,
+            "Symbol": r["ticker"],
+            "Name": r["name"],
+            "Price": r["price"],
+            "Change %": r["change_pct"],
+            "Score": r["score"],
+            "Entry": r.get("entry", 0),
+            "Stop": r.get("stop_loss", 0),
+            "Target 1": r.get("target1", 0),
+            "Target 2": r.get("target2", 0),
+            "R:R": r.get("rr1", 0),
+            "RSI": r.get("rsi", 0),
+        })
+    df_picks = pd.DataFrame(rows)
+
+    def _highlight_score(val):
+        if val >= 75:
+            return "background-color: #1b5e20; color: white"
+        elif val >= 50:
+            return "background-color: #33691e; color: white"
+        elif val >= 25:
+            return "background-color: #e65100; color: white"
+        else:
+            return "background-color: #b71c1c; color: white"
+
+    styled = df_picks.style.map(_highlight_score, subset=["Score"])
+    st.dataframe(styled, width="stretch", hide_index=True)
+
+    st.caption(
+        "Long-biased swing setups (entry = last close, stop = ATR-based, "
+        "targets = 2:1 / 3:1). Data may be delayed. Not financial advice — "
+        "confirm on your own analysis before trading. Use the **Swing Scanner** "
+        "page to size and place an order for any of these symbols."
+    )
+
+
 # ---------------------------------------------------------------------------
 # App layout
 # ---------------------------------------------------------------------------
 
 PAGES = {
     "Dashboard": page_dashboard,
+    "Tomorrow's Picks": page_tomorrow,
     "Swing Scanner": page_swing,
     "Intraday Scanner": page_intraday,
     "Market Data": page_market_data,
@@ -1367,6 +1512,7 @@ PAGES = {
 # Per-page controls rendered in the sidebar to keep the main area focused
 # on results and actions.
 SIDEBAR_CONTROLS = {
+    "Tomorrow's Picks": sidebar_tomorrow,
     "Swing Scanner": sidebar_swing,
     "Intraday Scanner": sidebar_intraday,
 }
