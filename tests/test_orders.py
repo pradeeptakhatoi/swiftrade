@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -259,3 +260,87 @@ class TestPlaceExitBypass:
             settings=test_settings,
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# order proxy — order calls exit via DHAN_PROXY (static-IP egress)
+# ---------------------------------------------------------------------------
+
+
+class TestOrderProxy:
+    @patch("dhan_algo.orders.journal_record")
+    @patch("dhan_algo.orders.check_order", return_value=None)
+    def test_proxy_applied_during_order_and_restored(
+        self, mock_check, mock_journal, mock_client, test_settings
+    ):
+        test_settings.dhan_live = True
+        test_settings.dhan_proxy = "http://10.0.0.1:8080"
+        session = SimpleNamespace(proxies={})
+        mock_client.dhan_http.session = session
+
+        seen = {}
+
+        def _place(**kwargs):
+            seen["proxies"] = dict(session.proxies)
+            return {"status": "success", "data": {"orderId": "1"}}
+
+        mock_client.place_order.side_effect = _place
+
+        place(
+            mock_client, "2885", side="BUY", qty=1,
+            order_type="MARKET", product="INTRA", price=100.0,
+            settings=test_settings,
+        )
+        # Proxy was active during the call...
+        assert seen["proxies"] == {
+            "http": "http://10.0.0.1:8080",
+            "https": "http://10.0.0.1:8080",
+        }
+        # ...and restored to the original afterward.
+        assert session.proxies == {}
+
+    @patch("dhan_algo.orders.journal_record")
+    @patch("dhan_algo.orders.check_order", return_value=None)
+    def test_no_proxy_leaves_session_untouched(
+        self, mock_check, mock_journal, mock_client, test_settings
+    ):
+        test_settings.dhan_live = True
+        test_settings.dhan_proxy = ""
+        session = SimpleNamespace(proxies={})
+        mock_client.dhan_http.session = session
+
+        seen = {}
+
+        def _place(**kwargs):
+            seen["proxies"] = dict(session.proxies)
+            return {"status": "success", "data": {"orderId": "1"}}
+
+        mock_client.place_order.side_effect = _place
+
+        place(
+            mock_client, "2885", side="BUY", qty=1,
+            order_type="MARKET", product="INTRA", price=100.0,
+            settings=test_settings,
+        )
+        assert seen["proxies"] == {}
+        assert session.proxies == {}
+
+    @patch("dhan_algo.orders.journal_record")
+    @patch("dhan_algo.orders.check_order", return_value=None)
+    def test_proxy_restored_even_when_order_raises(
+        self, mock_check, mock_journal, mock_client, test_settings
+    ):
+        test_settings.dhan_live = True
+        test_settings.dhan_proxy = "http://10.0.0.1:8080"
+        session = SimpleNamespace(proxies={"https": "http://old"})
+        mock_client.dhan_http.session = session
+        mock_client.place_order.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            place(
+                mock_client, "2885", side="BUY", qty=1,
+                order_type="MARKET", product="INTRA", price=100.0,
+                settings=test_settings,
+            )
+        # Prior proxies restored despite the exception.
+        assert session.proxies == {"https": "http://old"}

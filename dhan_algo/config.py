@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     feed_mode: str = "poll"
     default_data_source: str = "Dhan API"  # "Dhan API" or "Yahoo Finance"
     security_master_path: str = "security_id_list.csv"  # offline scrip-master fallback
+    dhan_proxy: str = ""  # HTTPS proxy for order calls (e.g. static-IP egress)
 
 
 @lru_cache(maxsize=1)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from contextlib import contextmanager
 
 from dhanhq import dhanhq
 
@@ -13,6 +15,43 @@ from dhan_algo.market_data import ltp
 from dhan_algo.risk import check_order
 
 logger = logging.getLogger(__name__)
+
+# Serialises proxy state changes on the shared client session so the strategy
+# and exit-manager worker threads can't clobber each other mid-order.
+_proxy_lock = threading.Lock()
+
+
+def _client_session(client):
+    """Best-effort access to the dhanhq client's underlying requests session."""
+    try:
+        return client.dhan_http.session
+    except AttributeError:
+        return None
+
+
+@contextmanager
+def _order_proxy(client, settings: Settings):
+    """Route order HTTP through ``settings.dhan_proxy`` for the duration.
+
+    Dhan enforces a whitelisted static IP for *order placement* (error
+    DH-905), while data APIs do not. Setting ``DHAN_PROXY`` to a fixed-IP
+    HTTPS proxy makes only the order calls exit from that IP; data traffic is
+    left untouched. Restores the session's prior proxies afterward, under a
+    lock so concurrent workers don't race on the shared session.
+    """
+    proxy = (settings.dhan_proxy or "").strip()
+    session = _client_session(client) if proxy else None
+    if session is None:
+        yield
+        return
+    with _proxy_lock:
+        saved = getattr(session, "proxies", {})
+        try:
+            session.proxies = {"http": proxy, "https": proxy}
+            logger.info("Routing order via proxy %s", proxy)
+            yield
+        finally:
+            session.proxies = saved
 
 
 def place(
@@ -102,7 +141,8 @@ def place(
     if trigger_price > 0:
         order_kwargs["trigger_price"] = float(trigger_price)
 
-    resp = client.place_order(**order_kwargs)
+    with _order_proxy(client, settings):
+        resp = client.place_order(**order_kwargs)
     if ok(resp):
         logger.info("PLACED: %s", resp)
         journal_record(
@@ -216,18 +256,19 @@ def place_bracket(
         )
         return {"status": "dry_run", "plan": plan}
 
-    resp = client.place_super_order(
-        security_id=str(security_id),
-        exchange_segment=d_seg,
-        transaction_type=txn,
-        quantity=int(qty),
-        order_type=client.LIMIT,
-        product_type=client.INTRA,
-        price=float(entry_price),
-        targetPrice=float(target_price),
-        stopLossPrice=float(stop_loss_price),
-        trailingJump=float(trailing_jump),
-    )
+    with _order_proxy(client, settings):
+        resp = client.place_super_order(
+            security_id=str(security_id),
+            exchange_segment=d_seg,
+            transaction_type=txn,
+            quantity=int(qty),
+            order_type=client.LIMIT,
+            product_type=client.INTRA,
+            price=float(entry_price),
+            targetPrice=float(target_price),
+            stopLossPrice=float(stop_loss_price),
+            trailingJump=float(trailing_jump),
+        )
 
     status = "placed" if ok(resp) else "failed"
     log_fn = logger.info if status == "placed" else logger.warning
