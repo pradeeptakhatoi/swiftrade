@@ -59,6 +59,7 @@ cp .env.example .env
 | `LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR, CRITICAL |
 | `JOURNAL_PATH` | `trades.csv` | Path for the trade journal CSV |
 | `FEED_MODE` | `poll` | `poll` or `ws` (WebSocket) |
+| `DHAN_PROXY` | *(empty)* | HTTPS proxy for order calls only, e.g. `http://STATIC_IP:8080` (see [Static IP for orders](#static-ip-for-orders)) |
 
 ## Starting the app
 
@@ -167,6 +168,44 @@ To go live, set **either**:
 
 - `DHAN_LIVE=1` in your `.env`, **or**
 - pass `--live` on the CLI
+
+## Static IP for orders
+
+Dhan requires a **whitelisted static IP** for order placement — you'll get
+error **DH-905** if orders come from an unlisted IP. This applies only to
+order placement; data APIs (scanners, quotes, historical) work from any IP,
+so most users hit this only when going live.
+
+Home and office connections usually have a *dynamic* public IP that changes.
+`DHAN_PROXY` lets you route **only the order calls** through a fixed-IP HTTPS
+proxy, so orders exit from the whitelisted IP while data traffic stays direct
+(fast, and unaffected if the proxy is down).
+
+### Setup
+
+1. Stand up an HTTPS proxy on a host that has a static public IP:
+   - A small cloud VPS (AWS EC2 + Elastic IP, Oracle Cloud Always-Free,
+     DigitalOcean, Hetzner) running `tinyproxy` or `squid`, **or**
+   - a static-IP VPN/proxy service.
+2. Whitelist that static IP in the Dhan portal:
+   **web.dhan.co > Profile > DhanHQ Trading APIs**.
+3. Point the app at the proxy in `.env`:
+
+   ```bash
+   DHAN_PROXY=http://STATIC_IP:8080
+   DHAN_LIVE=1
+   ```
+
+Leave `DHAN_PROXY` empty (the default) and orders go out directly, unchanged.
+
+Only `place_order` and `place_super_order` are routed through the proxy. The
+proxy is applied and restored on the shared client session under a lock, so
+the Strategy Runner and Exit Manager worker threads never clobber each other
+mid-order.
+
+> **Tip:** The most robust option is to run the whole app on the static-IP
+> VPS. You then don't need a proxy at all — just whitelist the VPS IP — and
+> the Exit Manager can run around the clock.
 
 ## Running tests
 
