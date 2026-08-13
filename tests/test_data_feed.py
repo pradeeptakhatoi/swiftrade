@@ -7,6 +7,8 @@ import pandas as pd
 from dhan_algo.data_feed import (
     DHAN,
     YAHOO,
+    DhanUnavailable,
+    _fetch_reason,
     bars_to_frame,
     fetch_universe,
     period_to_dates,
@@ -171,3 +173,64 @@ class TestFetchUniverse:
         )
         assert seen["interval"] == "minute"
         assert seen["interval_minutes"] == 15
+
+
+# --- diagnostic reasons -----------------------------------------------------
+
+class TestFetchReason:
+    def test_token_error(self):
+        assert _fetch_reason(RuntimeError("Invalid token")) == "Dhan token invalid or expired"
+
+    def test_subscription_error(self):
+        exc = DhanUnavailable("no candles returned (Data API not subscribed or no history)")
+        assert _fetch_reason(exc) == "Data API not subscribed"
+
+    def test_rate_limit_error(self):
+        assert _fetch_reason(RuntimeError("429 too many requests")) == "Dhan rate limit hit"
+
+    def test_scrip_master_error(self):
+        exc = DhanUnavailable("symbol not found in scrip master")
+        assert _fetch_reason(exc) == "symbol not found in scrip master"
+
+    def test_unknown_error_passes_through(self):
+        assert _fetch_reason(RuntimeError("weird failure")) == "weird failure"
+
+
+class TestFetchReportReasons:
+    def test_reason_recorded_on_exception(self):
+        def dhan(client, sym, **kw):
+            raise DhanUnavailable("symbol not found in scrip master")
+        yf = _fake_yahoo({"AAA": _frame(250)})
+        _, report = fetch_universe(
+            ["AAA"], source=DHAN, min_bars=220, client=object(),
+            dhan_fetch=dhan, yahoo_fetch=yf, pace=0,
+        )
+        assert report.reasons["AAA"] == "symbol not found in scrip master"
+        assert report.dominant_reason() == "symbol not found in scrip master"
+
+    def test_no_client_reason_is_not_logged_in(self):
+        yf = _fake_yahoo({"AAA": _frame(250)})
+        _, report = fetch_universe(
+            ["AAA"], source=DHAN, min_bars=220, client=None, yahoo_fetch=yf,
+        )
+        assert report.reasons["AAA"] == "not logged in to Dhan"
+        assert report.dominant_reason() == "not logged in to Dhan"
+
+    def test_dominant_reason_picks_most_common(self):
+        def dhan(client, sym, **kw):
+            if sym == "SOLO":
+                raise RuntimeError("429 too many requests")
+            raise DhanUnavailable("no candles returned (Data API not subscribed or no history)")
+        yf = _fake_yahoo({s: _frame(250) for s in ("A", "B", "SOLO")})
+        _, report = fetch_universe(
+            ["A", "B", "SOLO"], source=DHAN, min_bars=220, client=object(),
+            dhan_fetch=dhan, yahoo_fetch=yf, pace=0,
+        )
+        assert report.dominant_reason() == "Data API not subscribed"
+
+    def test_empty_reasons_dominant_is_blank(self):
+        yf = _fake_yahoo({"AAA": _frame(250)})
+        _, report = fetch_universe(
+            ["AAA"], source=YAHOO, min_bars=5, yahoo_fetch=yf,
+        )
+        assert report.dominant_reason() == ""

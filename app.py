@@ -1060,9 +1060,11 @@ def _scanner_fetch(
         )
 
     if report.fell_back:
+        reason = report.dominant_reason()
+        reason_txt = f" — {reason}" if reason else ""
         st.info(
-            f"Dhan unavailable for {len(report.fell_back)} symbol(s); used "
-            f"Yahoo fallback: {', '.join(report.fell_back)}"
+            f"Dhan unavailable for {len(report.fell_back)} symbol(s){reason_txt}; "
+            f"used Yahoo fallback: {', '.join(report.fell_back)}"
         )
     if report.skipped:
         st.caption(f"Skipped (insufficient data): {', '.join(report.skipped)}")

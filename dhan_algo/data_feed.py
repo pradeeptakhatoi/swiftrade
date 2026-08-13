@@ -40,6 +40,31 @@ _OHLCV = ("Open", "High", "Low", "Close", "Volume")
 _PERIOD_DAYS = {"d": 1, "wk": 7, "mo": 30, "y": 365}
 
 
+class DhanUnavailable(Exception):
+    """A single-symbol Dhan fetch failed, carrying a human-readable reason."""
+
+
+def _fetch_reason(exc: Exception) -> str:
+    """Classify a Dhan fetch failure into a short, user-facing reason.
+
+    Groups the many low-level error strings into a handful of actionable
+    buckets (auth, subscription, rate limit) so the UI can tell the user
+    *why* it fell back rather than dumping a raw traceback.
+    """
+    msg = str(exc).lower()
+    if any(k in msg for k in ("token", "unauthor", "invalid client", "dh-901", "expired")):
+        return "Dhan token invalid or expired"
+    if any(k in msg for k in ("not subscribed", "subscription", "entitle", "not authorized for")):
+        return "Data API not subscribed"
+    if any(k in msg for k in ("rate", "too many", "429")):
+        return "Dhan rate limit hit"
+    if "scrip master" in msg or "not found" in msg:
+        return "symbol not found in scrip master"
+    if "no candles" in msg:
+        return "no candles returned (Data API not subscribed or no history)"
+    return str(exc) or "unknown Dhan error"
+
+
 def period_to_dates(period: str, *, today: date | None = None) -> tuple[str, str]:
     """Convert a yfinance-style *period* (``"1y"``, ``"6mo"``, ``"5d"``) to
     ``(from_date, to_date)`` ISO date strings. Unknown formats default to 1 year.
@@ -78,11 +103,16 @@ def fetch_dhan_frame(
     interval_minutes: int = 15,
     resolve=resolve_security_id,
     fetch=fetch_historical,
-) -> pd.DataFrame | None:
-    """Fetch a single symbol's OHLCV frame from Dhan. Returns None on failure."""
+) -> pd.DataFrame:
+    """Fetch a single symbol's OHLCV frame from Dhan.
+
+    Raises :class:`DhanUnavailable` with a human-readable reason when the
+    symbol cannot be resolved or no candles come back, so callers can report
+    *why* a fetch failed rather than silently falling back.
+    """
     sid = resolve(client, symbol)
     if sid is None:
-        return None
+        raise DhanUnavailable("symbol not found in scrip master")
     if interval == "minute":
         bars = fetch(
             client, sid, from_date=from_date, to_date=to_date,
@@ -93,7 +123,11 @@ def fetch_dhan_frame(
             client, sid, from_date=from_date, to_date=to_date, interval="day",
         )
     frame = bars_to_frame(bars)
-    return frame if not frame.empty else None
+    if frame.empty:
+        raise DhanUnavailable(
+            "no candles returned (Data API not subscribed or no history)"
+        )
+    return frame
 
 
 def fetch_yahoo_frames(
@@ -142,6 +176,20 @@ class FetchReport:
     dhan_failed: list[str] = field(default_factory=list)
     fell_back: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    reasons: dict[str, str] = field(default_factory=dict)
+
+    def dominant_reason(self) -> str:
+        """Return the most common per-symbol failure reason, or ``""``.
+
+        Lets the UI summarise *why* Dhan was unavailable in one phrase
+        instead of listing a distinct reason for every symbol.
+        """
+        if not self.reasons:
+            return ""
+        counts: dict[str, int] = {}
+        for reason in self.reasons.values():
+            counts[reason] = counts.get(reason, 0) + 1
+        return max(counts, key=counts.get)
 
 
 def _yahoo_interval(interval: str, interval_minutes: int) -> str:
@@ -177,6 +225,8 @@ def fetch_universe(
     if source == DHAN and client is None:
         # Requested Dhan but not logged in — degrade to Yahoo for everything.
         report.fell_back = list(symbols)
+        for sym in symbols:
+            report.reasons[sym] = "not logged in to Dhan"
 
     if want_dhan:
         from_date, to_date = period_to_dates(period, today=today)
@@ -189,11 +239,13 @@ def fetch_universe(
                 )
             except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
                 logger.warning("Dhan fetch failed for %s: %s", sym, exc)
+                report.reasons[sym] = _fetch_reason(exc)
                 frame = None
             if frame is not None and not frame.empty:
                 frames[sym] = frame
             else:
                 report.dhan_failed.append(sym)
+                report.reasons.setdefault(sym, "no data returned")
             if pace:
                 sleep(pace)
 
