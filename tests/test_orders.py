@@ -56,6 +56,30 @@ class TestCalculatePositionSize:
         qty = calculate_position_size(2000.0, 1990.0, 5000.0, max_qty=50, max_order_value=50_000)
         assert qty == 25  # 50_000 / 2000 = 25 < 50
 
+    def test_capital_pct_caps_position(self):
+        # Risk alone would allow 100, but 10% of 100k capital = 10k / 100 = 100...
+        # use a tighter pct to bind: 5% of 100k = 5k / 100 = 50 shares.
+        qty = calculate_position_size(
+            100.0, 95.0, 5000.0, max_qty=1000, max_order_value=1_000_000,
+            capital=100_000.0, max_position_pct=5.0,
+        )
+        assert qty == 50
+
+    def test_capital_pct_ignored_when_capital_zero(self):
+        qty = calculate_position_size(
+            100.0, 95.0, 500.0, max_qty=200, max_order_value=100_000,
+            capital=0.0, max_position_pct=5.0,
+        )
+        assert qty == 100
+
+    def test_capital_pct_not_binding_when_generous(self):
+        # 50% of 100k = 50k / 100 = 500 shares -> risk cap (100) still wins.
+        qty = calculate_position_size(
+            100.0, 95.0, 500.0, max_qty=200, max_order_value=100_000,
+            capital=100_000.0, max_position_pct=50.0,
+        )
+        assert qty == 100
+
 
 # ---------------------------------------------------------------------------
 # place_bracket

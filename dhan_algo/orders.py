@@ -46,7 +46,7 @@ def place(
 
     # ---- risk guards ----
     ref_price = price if price > 0 else (ltp(client, security_id, d_seg) or 0)
-    block_reason = check_order(qty, ref_price, security_id, client, settings)
+    block_reason = check_order(qty, ref_price, security_id, client, settings, side=side)
     if block_reason:
         logger.warning("BLOCKED: %s", block_reason)
         journal_record(
@@ -131,11 +131,19 @@ def calculate_position_size(
     risk_amount: float,
     max_qty: int,
     max_order_value: float,
+    *,
+    capital: float = 0.0,
+    max_position_pct: float = 0.0,
 ) -> int:
     """Calculate quantity based on risk amount and stop-loss distance.
 
     qty = floor(risk_amount / abs(entry - stop_loss)),
     clamped to *max_qty* and *max_order_value*.
+
+    When both *capital* and *max_position_pct* are positive, the position is
+    additionally capped so its notional never exceeds that percentage of
+    capital (capital-aware sizing).
+
     Returns 0 if inputs are invalid.
     """
     risk_per_share = abs(entry_price - stop_loss_price)
@@ -145,6 +153,9 @@ def calculate_position_size(
     qty = min(qty, max_qty)
     max_qty_by_value = int(max_order_value / entry_price)
     qty = min(qty, max_qty_by_value)
+    if capital > 0 and max_position_pct > 0:
+        cap_value = capital * (max_position_pct / 100.0)
+        qty = min(qty, int(cap_value / entry_price))
     return max(qty, 0)
 
 
@@ -170,7 +181,7 @@ def place_bracket(
     txn = client.BUY if side.upper() == "BUY" else client.SELL
 
     ref_price = entry_price if entry_price > 0 else (ltp(client, security_id, d_seg) or 0)
-    block_reason = check_order(qty, ref_price, security_id, client, settings)
+    block_reason = check_order(qty, ref_price, security_id, client, settings, side=side)
     if block_reason:
         logger.warning("BLOCKED bracket: %s", block_reason)
         journal_record(

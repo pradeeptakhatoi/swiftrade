@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     max_qty: int = 50
     max_order_value: float = 50_000
     max_daily_loss: float = 10_000
+    max_open_positions: int = 0  # cap on concurrent open positions; 0 = unlimited
+    max_consecutive_losses: int = 0  # halt after N losing trades in a row; 0 = off
+    max_position_pct: float = 0  # max % of capital per position; 0 = off
+    trading_capital: float = 0  # capital base for % sizing; 0 = off
     strategy_interval: int = 60
     log_level: str = "INFO"
     risk_per_trade: float = 0  # INR risk per trade; 0 = manual qty

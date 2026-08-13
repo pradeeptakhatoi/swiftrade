@@ -405,7 +405,10 @@ class OrbBreakoutStrategy(MultiStrategy):
             qty = self.qty
             if self.risk_per_trade > 0 and risk > 0.01:
                 s = self._settings or get_settings()
-                qty = calculate_position_size(price, sl, self.risk_per_trade, s.max_qty, s.max_order_value)
+                qty = calculate_position_size(
+                    price, sl, self.risk_per_trade, s.max_qty, s.max_order_value,
+                    capital=s.trading_capital, max_position_pct=s.max_position_pct,
+                )
                 qty = max(qty, 1)
 
             state["long_traded"] = True
@@ -433,7 +436,10 @@ class OrbBreakoutStrategy(MultiStrategy):
             qty = self.qty
             if self.risk_per_trade > 0 and risk > 0.01:
                 s = self._settings or get_settings()
-                qty = calculate_position_size(price, sl, self.risk_per_trade, s.max_qty, s.max_order_value)
+                qty = calculate_position_size(
+                    price, sl, self.risk_per_trade, s.max_qty, s.max_order_value,
+                    capital=s.trading_capital, max_position_pct=s.max_position_pct,
+                )
                 qty = max(qty, 1)
 
             state["short_traded"] = True

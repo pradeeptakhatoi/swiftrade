@@ -433,6 +433,10 @@ EDITABLE_CONFIG_FIELDS = (
     "max_qty",
     "max_order_value",
     "max_daily_loss",
+    "max_open_positions",
+    "max_consecutive_losses",
+    "max_position_pct",
+    "trading_capital",
     "risk_per_trade",
     "strategy_interval",
     "log_level",
@@ -448,6 +452,10 @@ def _config_store() -> dict:
             "max_qty": int(base.max_qty),
             "max_order_value": float(base.max_order_value),
             "max_daily_loss": float(base.max_daily_loss),
+            "max_open_positions": int(base.max_open_positions),
+            "max_consecutive_losses": int(base.max_consecutive_losses),
+            "max_position_pct": float(base.max_position_pct),
+            "trading_capital": float(base.trading_capital),
             "risk_per_trade": float(base.risk_per_trade),
             "strategy_interval": int(base.strategy_interval),
             "log_level": base.log_level,
@@ -686,6 +694,15 @@ def page_dashboard() -> None:
         r3, r4 = st.columns(2)
         r3.metric("Max daily loss", f"{settings.max_daily_loss:,.0f}")
         r4.metric("Strategy interval", f"{settings.strategy_interval}s")
+        r5, r6 = st.columns(2)
+        r5.metric(
+            "Max open positions",
+            settings.max_open_positions or "—",
+        )
+        r6.metric(
+            "Max loss streak",
+            settings.max_consecutive_losses or "—",
+        )
 
 
 def page_market_data() -> None:
@@ -1623,6 +1640,7 @@ def page_intraday() -> None:
         auto_qty = calculate_position_size(
             _entry_default, _sl_default,
             settings.risk_per_trade, settings.max_qty, settings.max_order_value,
+            capital=settings.trading_capital, max_position_pct=settings.max_position_pct,
         )
         st.caption(
             f"Position sizing: risk {settings.risk_per_trade:.0f} INR / "
@@ -1913,6 +1931,7 @@ def page_swing() -> None:
         sw_auto_qty = calculate_position_size(
             _sw_entry_default, _sw_sl_default,
             settings.risk_per_trade, settings.max_qty, settings.max_order_value,
+            capital=settings.trading_capital, max_position_pct=settings.max_position_pct,
         )
         st.caption(
             f"Position sizing: risk {settings.risk_per_trade:.0f} INR / "
@@ -2212,6 +2231,21 @@ def page_settings() -> None:
                 help="Trading is halted once realised loss reaches this.",
             )
 
+        st.markdown("**Trading halts** — 0 disables a guard")
+        h1, h2 = st.columns(2)
+        with h1:
+            max_open_positions = st.number_input(
+                "Max open positions", min_value=0, step=1,
+                value=int(cfg.get("max_open_positions", 0)),
+                help="New entries are blocked once this many positions are open.",
+            )
+        with h2:
+            max_consecutive_losses = st.number_input(
+                "Max consecutive losses", min_value=0, step=1,
+                value=int(cfg.get("max_consecutive_losses", 0)),
+                help="Entries are paused after this many losing trades in a row.",
+            )
+
         st.markdown("**Position sizing & strategy**")
         c4, c5 = st.columns(2)
         with c4:
@@ -2224,6 +2258,20 @@ def page_settings() -> None:
             strategy_interval = st.number_input(
                 "Strategy poll interval (s)", min_value=5, max_value=3600, step=5,
                 value=int(cfg["strategy_interval"]),
+            )
+
+        c8, c9 = st.columns(2)
+        with c8:
+            trading_capital = st.number_input(
+                "Trading capital (INR)", min_value=0.0, step=10000.0,
+                value=float(cfg.get("trading_capital", 0.0)),
+                help="Capital base for percentage-of-capital position sizing. 0 = off.",
+            )
+        with c9:
+            max_position_pct = st.number_input(
+                "Max position size (% of capital)", min_value=0.0, max_value=100.0,
+                step=1.0, value=float(cfg.get("max_position_pct", 0.0)),
+                help="Caps each position's notional at this % of capital. 0 = off.",
             )
 
         st.markdown("**Runtime**")
@@ -2250,6 +2298,10 @@ def page_settings() -> None:
             "max_qty": int(max_qty),
             "max_order_value": float(max_order_value),
             "max_daily_loss": float(max_daily_loss),
+            "max_open_positions": int(max_open_positions),
+            "max_consecutive_losses": int(max_consecutive_losses),
+            "max_position_pct": float(max_position_pct),
+            "trading_capital": float(trading_capital),
             "risk_per_trade": float(risk_per_trade),
             "strategy_interval": int(strategy_interval),
             "log_level": log_level,
