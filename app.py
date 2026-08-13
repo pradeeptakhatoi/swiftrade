@@ -12,6 +12,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from dhan_algo import analytics, journal
 from dhan_algo.config import Settings
 from dhan_algo.client import get_client, ok
 from dhan_algo.market_data import ltp
@@ -1220,7 +1221,7 @@ def page_backtest() -> None:
 
         result = st.session_state.get("itb_result")
         if result is not None:
-            _display_intraday_sim(result)
+            _display_intraday_sim(result, strategy="intraday")
 
     with tab_swing:
         st.caption(
@@ -1329,10 +1330,10 @@ def page_backtest() -> None:
 
         result = st.session_state.get("stb_result")
         if result is not None:
-            _display_intraday_sim(result)
+            _display_intraday_sim(result, strategy="swing")
 
 
-def _display_intraday_sim(result) -> None:
+def _display_intraday_sim(result, strategy: str | None = None) -> None:
     if result.total_trades == 0:
         st.info(
             "No trades were triggered. Lower the entry score threshold or widen "
@@ -1365,6 +1366,29 @@ def _display_intraday_sim(result) -> None:
     st.caption("Trades")
     trades_df = pd.DataFrame([asdict(t) for t in result.trades])
     st.dataframe(trades_df, width="stretch", hide_index=True)
+
+    if strategy:
+        if st.button(
+            "Save to performance log", key=f"{strategy}_save_log",
+            help="Append these simulated round-trip trades to the performance "
+                 "log so they show up on the Performance page.",
+        ):
+            for t in result.trades:
+                journal.record_closed_trade(
+                    strategy=strategy,
+                    symbol=t.symbol,
+                    entry_time=str(t.entry_time),
+                    exit_time=str(t.exit_time),
+                    qty=t.qty,
+                    entry_price=t.entry_price,
+                    exit_price=t.exit_price,
+                    exit_reason=t.exit_reason,
+                    gross_pnl=t.gross_pnl,
+                    cost=t.cost,
+                    net_pnl=t.net_pnl,
+                    r_multiple=t.r_multiple,
+                )
+            st.success(f"Saved {result.total_trades} trades to the performance log.")
 
 
 def _run_and_display_backtest(all_bars: dict[str, list]) -> None:
@@ -1455,6 +1479,107 @@ def page_journal() -> None:
 
     st.dataframe(filtered, width="stretch", hide_index=True)
     st.caption(f"{len(filtered)} of {len(df)} entries shown")
+
+
+def _sim_trades_df(result) -> pd.DataFrame:
+    """Closed-trade DataFrame from a simulation result (or empty)."""
+    if result is None or result.total_trades == 0:
+        return pd.DataFrame()
+    return pd.DataFrame([asdict(t) for t in result.trades])
+
+
+def _performance_source_df() -> tuple[pd.DataFrame, str]:
+    """Resolve the trade set to analyse from a user-chosen source."""
+    import os
+
+    log_path = journal.closed_trades_path()
+    options = ["Saved performance log"]
+    if st.session_state.get("itb_result") is not None:
+        options.append("Latest intraday simulation")
+    if st.session_state.get("stb_result") is not None:
+        options.append("Latest swing simulation")
+
+    source = st.radio("Data source", options, horizontal=True, key="perf_source")
+
+    if source == "Latest intraday simulation":
+        return _sim_trades_df(st.session_state.get("itb_result")), source
+    if source == "Latest swing simulation":
+        return _sim_trades_df(st.session_state.get("stb_result")), source
+
+    if not os.path.exists(log_path):
+        st.info(
+            f"No performance log yet at `{log_path}`. Run a trade simulation on "
+            "the Backtest page and click **Save to performance log**, or select a "
+            "live simulation above."
+        )
+        return pd.DataFrame(), source
+    try:
+        return pd.read_csv(log_path), source
+    except Exception as e:  # pragma: no cover - defensive file read
+        st.error(f"Error reading performance log: {e}")
+        return pd.DataFrame(), source
+
+
+def page_performance() -> None:
+    st.caption(
+        "Analyse realised round-trip trades: equity curve, expectancy, profit "
+        "factor, R-multiple distribution, and per-group breakdowns."
+    )
+
+    df, source = _performance_source_df()
+    if df is None or df.empty:
+        return
+
+    m = analytics.compute_metrics(df)
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades", m["trades"])
+        c2.metric("Win rate", f"{m['win_rate']:.0f}%")
+        c3.metric("Avg R", f"{m['avg_r']:.2f}")
+        pf = m["profit_factor"]
+        c4.metric("Profit factor", "inf" if pf == float("inf") else f"{pf:.2f}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Gross P&L", f"{m['gross_pnl']:,.0f}")
+        c6.metric("Costs", f"{m['total_costs']:,.0f}")
+        c7.metric(
+            "Net P&L", f"{m['net_pnl']:,.0f}",
+            delta=f"{m['expectancy']:,.1f}/trade",
+        )
+        c8.metric("Max drawdown", f"{m['max_drawdown']:,.0f}")
+
+    curve = analytics.equity_curve(df)
+    if not curve.empty:
+        st.caption("Equity curve (cumulative net P&L)")
+        st.line_chart(curve, x="trade", y="equity", height=220)
+
+    dist = analytics.r_distribution(df)
+    if not dist.empty:
+        st.caption("R-multiple distribution")
+        st.bar_chart(dist, x="bucket", y="count", height=220)
+
+    st.caption("Breakdown")
+    by_labels = {
+        "Symbol": "symbol",
+        "Strategy": "strategy",
+        "Exit reason": "exit_reason",
+        "Hour of day": "hour",
+    }
+    available = [
+        label for label, col in by_labels.items()
+        if col == "hour" or col in df.columns
+    ]
+    if available:
+        choice = st.selectbox("Group by", available, key="perf_group_by")
+        table = analytics.breakdown(df, by_labels[choice])
+        if not table.empty:
+            st.dataframe(table, width="stretch", hide_index=True)
+        else:
+            st.info("Not enough data for this breakdown.")
+
+    with st.expander("All trades"):
+        st.dataframe(df, width="stretch", hide_index=True)
 
 
 def page_kill_switch() -> None:
@@ -2397,6 +2522,7 @@ PAGES = {
     "Positions & Orders": page_positions_orders,
     "Strategy": page_strategy,
     "Backtest": page_backtest,
+    "Performance": page_performance,
     "Trade Journal": page_journal,
     "Settings": page_settings,
     "Kill Switch": page_kill_switch,
