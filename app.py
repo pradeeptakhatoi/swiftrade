@@ -166,6 +166,74 @@ def symbol_multiselect(
 
 
 # ---------------------------------------------------------------------------
+# P&L estimator — gross profit, itemised charges and net profit
+# ---------------------------------------------------------------------------
+
+
+def render_trade_pnl(
+    entry: float,
+    exit_price: float,
+    qty: int,
+    *,
+    product: str = "INTRA",
+    container=st,
+) -> None:
+    """Show gross P&L, itemised charges (STT, GST, etc.) and net P&L.
+
+    Assumes a long round-trip: BUY at *entry*, SELL at *exit_price*. Charges
+    are computed for both legs with the realistic NSE cost model.
+    """
+    if entry <= 0 or exit_price <= 0 or qty <= 0:
+        return
+
+    costs = TradingCosts()
+    buy = costs.breakdown("BUY", entry, qty, product)
+    sell = costs.breakdown("SELL", exit_price, qty, product)
+
+    gross = (exit_price - entry) * qty
+    charges = {
+        "Brokerage": buy["brokerage"] + sell["brokerage"],
+        "STT": buy["stt"] + sell["stt"],
+        "Exchange txn": buy["exchange"] + sell["exchange"],
+        "SEBI fee": buy["sebi"] + sell["sebi"],
+        "Stamp duty": buy["stamp_duty"] + sell["stamp_duty"],
+        "GST (18%)": buy["gst"] + sell["gst"],
+    }
+    total_charges = buy["total"] + sell["total"]
+    net = gross - total_charges
+
+    m1, m2, m3 = container.columns(3)
+    m1.metric("Gross P&L", f"{gross:,.2f}")
+    m2.metric("Total charges", f"-{total_charges:,.2f}")
+    m3.metric("Net P&L", f"{net:,.2f}", delta=f"{net - gross:,.2f}")
+
+    rows = "".join(
+        f"<tr><td>{name}</td>"
+        f"<td style='text-align:right'>{val:,.2f}</td></tr>"
+        for name, val in charges.items()
+    )
+    container.markdown(
+        f"""
+<table style="width:100%; font-size:0.8rem; line-height:1.6; border-collapse:collapse;">
+<tr style="border-bottom:1px solid #444;">
+  <td><b>Charge</b></td><td style="text-align:right"><b>INR</b></td>
+</tr>
+{rows}
+<tr style="border-top:1px solid #444;">
+  <td><b>Total charges</b></td>
+  <td style="text-align:right"><b>{total_charges:,.2f}</b></td>
+</tr>
+</table>
+""",
+        unsafe_allow_html=True,
+    )
+    container.caption(
+        f"Buy {qty} @ {entry:,.2f} → Sell {qty} @ {exit_price:,.2f} "
+        f"({product}). Estimated per NSE charges; actuals may differ."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Logging capture — collect log records for in-app display
 # ---------------------------------------------------------------------------
 
@@ -1296,7 +1364,7 @@ def page_intraday() -> None:
         st.session_state["intra_sl_price"] = _sl_default
         st.session_state["intra_target_price"] = _target_default
 
-    with st.form("intra_order_form", border=True):
+    with st.container(border=True):
         st.caption(f"Bracket order for {selected_ticker} (entry + SL + target)")
         fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
         with fcol1:
@@ -1330,8 +1398,12 @@ def page_intraday() -> None:
                 key="intra_target_price",
             )
 
-        submitted = st.form_submit_button(
+        with st.expander("Estimated P&L (if target is hit)", expanded=True):
+            render_trade_pnl(entry_price, target_price, qty, product="INTRA")
+
+        submitted = st.button(
             "Place bracket order", type="primary", width="stretch",
+            key="intra_place",
         )
 
     if submitted:
@@ -1568,7 +1640,7 @@ def page_swing() -> None:
         st.session_state["sw_sl_price"] = _sw_sl_default
         st.session_state["sw_target_price"] = _sw_target_default
 
-    with st.form("swing_order_form", border=True):
+    with st.container(border=True):
         st.caption(f"Place order for {selected_ticker} (entry + SL + target)")
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
         with r1c1:
@@ -1584,7 +1656,7 @@ def page_swing() -> None:
                 key="sw_qty",
             )
 
-        r2c1, r2c2, r2c3, r2c4 = st.columns([1, 1, 1, 1])
+        r2c1, r2c2, r2c3 = st.columns(3)
         with r2c1:
             limit_price = st.number_input(
                 "Entry", min_value=0.0,
@@ -1600,11 +1672,16 @@ def page_swing() -> None:
                 "Target", min_value=0.0,
                 step=0.05, key="sw_target_price",
             )
-        with r2c4:
-            st.write("")
-            submitted = st.form_submit_button(
-                "Place order", type="primary", width="stretch",
+
+        with st.expander("Estimated P&L (if target is hit)", expanded=True):
+            render_trade_pnl(
+                limit_price if limit_price > 0 else _sw_entry_default,
+                sw_target, qty, product=product,
             )
+
+        submitted = st.button(
+            "Place order", type="primary", width="stretch", key="sw_place",
+        )
 
     if submitted:
         try:
