@@ -22,6 +22,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "AXISBANK": "Axis Bank",
     "WIPRO": "Wipro",
     "TMPV": "Tata Motors Passenger Vehicles",
+    "TMCV": "Tata Motors Commercial Vehicles",
     "MARUTI": "Maruti Suzuki",
     "SUNPHARMA": "Sun Pharma",
     "BAJFINANCE": "Bajaj Finance",
