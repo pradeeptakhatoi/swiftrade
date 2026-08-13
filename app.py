@@ -175,22 +175,28 @@ def render_trade_pnl(
     exit_price: float,
     qty: int,
     *,
+    stop: float | None = None,
     product: str = "INTRA",
     container=st,
 ) -> None:
-    """Show gross P&L, itemised charges (STT, GST, etc.) and net P&L.
+    """Show gross/net P&L at target and, when *stop* is given, at stop-loss.
 
-    Assumes a long round-trip: BUY at *entry*, SELL at *exit_price*. Charges
-    are computed for both legs with the realistic NSE cost model.
+    Assumes a long round-trip: BUY at *entry*, SELL at the exit. Charges are
+    computed for both legs with the realistic NSE cost model.
     """
     if entry <= 0 or exit_price <= 0 or qty <= 0:
         return
 
     costs = TradingCosts()
     buy = costs.breakdown("BUY", entry, qty, product)
-    sell = costs.breakdown("SELL", exit_price, qty, product)
 
-    gross = (exit_price - entry) * qty
+    def _scenario(sell_price: float) -> tuple[float, float, float, dict[str, float]]:
+        sell = costs.breakdown("SELL", sell_price, qty, product)
+        gross = (sell_price - entry) * qty
+        total_charges = buy["total"] + sell["total"]
+        return gross, total_charges, gross - total_charges, sell
+
+    gross, total_charges, net, sell = _scenario(exit_price)
     charges = {
         "Brokerage": buy["brokerage"] + sell["brokerage"],
         "STT": buy["stt"] + sell["stt"],
@@ -199,13 +205,24 @@ def render_trade_pnl(
         "Stamp duty": buy["stamp_duty"] + sell["stamp_duty"],
         "GST (18%)": buy["gst"] + sell["gst"],
     }
-    total_charges = buy["total"] + sell["total"]
-    net = gross - total_charges
 
+    container.markdown(f"**If target {exit_price:,.2f} is hit — profit**")
     m1, m2, m3 = container.columns(3)
     m1.metric("Gross P&L", f"{gross:,.2f}")
     m2.metric("Total charges", f"-{total_charges:,.2f}")
     m3.metric("Net P&L", f"{net:,.2f}", delta=f"{net - gross:,.2f}")
+
+    if stop is not None and stop > 0:
+        gross_s, charges_s, net_s, _ = _scenario(stop)
+        container.markdown(f"**If stop-loss {stop:,.2f} is hit — loss**")
+        s1, s2, s3 = container.columns(3)
+        s1.metric("Gross P&L", f"{gross_s:,.2f}")
+        s2.metric("Total charges", f"-{charges_s:,.2f}")
+        s3.metric("Net P&L", f"{net_s:,.2f}", delta=f"{net_s - gross_s:,.2f}")
+        if net_s < 0:
+            container.caption(
+                f"Net reward-to-risk ≈ {abs(net / net_s):.2f} : 1"
+            )
 
     rows = "".join(
         f"<tr><td>{name}</td>"
@@ -216,7 +233,8 @@ def render_trade_pnl(
         f"""
 <table style="width:100%; font-size:0.8rem; line-height:1.6; border-collapse:collapse;">
 <tr style="border-bottom:1px solid #444;">
-  <td><b>Charge</b></td><td style="text-align:right"><b>INR</b></td>
+  <td><b>Charge (round trip at target)</b></td>
+  <td style="text-align:right"><b>INR</b></td>
 </tr>
 {rows}
 <tr style="border-top:1px solid #444;">
@@ -228,8 +246,8 @@ def render_trade_pnl(
         unsafe_allow_html=True,
     )
     container.caption(
-        f"Buy {qty} @ {entry:,.2f} → Sell {qty} @ {exit_price:,.2f} "
-        f"({product}). Estimated per NSE charges; actuals may differ."
+        f"Buy {qty} @ {entry:,.2f} ({product}). "
+        f"Estimated per NSE charges; actuals may differ."
     )
 
 
@@ -1398,8 +1416,11 @@ def page_intraday() -> None:
                 key="intra_target_price",
             )
 
-        with st.expander("Estimated P&L (if target is hit)", expanded=True):
-            render_trade_pnl(entry_price, target_price, qty, product="INTRA")
+        with st.expander("Estimated P&L (target vs stop-loss)", expanded=True):
+            render_trade_pnl(
+                entry_price, target_price, qty,
+                stop=sl_price, product="INTRA",
+            )
 
         submitted = st.button(
             "Place bracket order", type="primary", width="stretch",
@@ -1673,10 +1694,10 @@ def page_swing() -> None:
                 step=0.05, key="sw_target_price",
             )
 
-        with st.expander("Estimated P&L (if target is hit)", expanded=True):
+        with st.expander("Estimated P&L (target vs stop-loss)", expanded=True):
             render_trade_pnl(
                 limit_price if limit_price > 0 else _sw_entry_default,
-                sw_target, qty, product=product,
+                sw_target, qty, stop=sw_sl, product=product,
             )
 
         submitted = st.button(
