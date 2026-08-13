@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     journal_path: str = "trades.csv"
     feed_mode: str = "poll"
     default_data_source: str = "Dhan API"  # "Dhan API" or "Yahoo Finance"
+    security_master_path: str = "security_id_list.csv"  # offline scrip-master fallback
 
 
 @lru_cache(maxsize=1)

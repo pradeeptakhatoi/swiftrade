@@ -4,7 +4,7 @@ __version__ = "0.1.0"
 
 from dhan_algo.client import get_client, ok, show_funds
 from dhan_algo.market_data import ltp, WebSocketTicker
-from dhan_algo.security_master import resolve_security_id
+from dhan_algo.security_master import resolve_security_id, resolve_security_ids
 from dhan_algo.orders import place, show_positions, show_orders
 from dhan_algo.risk import check_order, kill_switch
 from dhan_algo.journal import record as journal_record
@@ -35,6 +35,7 @@ __all__ = [
     "ltp",
     "WebSocketTicker",
     "resolve_security_id",
+    "resolve_security_ids",
     "place",
     "show_positions",
     "show_orders",
