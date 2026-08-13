@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -251,20 +252,58 @@ def fetch_historical(
             to_date=to_date,
         )
 
+    data = resp.get("data", {}) if isinstance(resp, dict) else {}
+    return _bars_from_response(data, security_id)
+
+
+def _epoch_to_iso(ts: Any) -> str:
+    """Convert a Dhan epoch-seconds timestamp to an ISO string; pass through
+    anything non-numeric unchanged."""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return str(ts)
+
+
+def _bars_from_response(data: Any, security_id: str) -> list[dict[str, Any]]:
+    """Normalise a DhanHQ historical response into a list of bar dicts.
+
+    The v2 Data API returns *columnar* data (``{"open": [...], "high": [...],
+    ...}``); older shapes return a list of row dicts. Both are handled.
+    """
     bars: list[dict[str, Any]] = []
-    raw = resp.get("data", []) if isinstance(resp, dict) else []
-    for row in raw:
-        bars.append(
-            {
-                "timestamp": str(row.get("timestamp", row.get("start_Time", ""))),
-                "security_id": security_id,
-                "open": float(row.get("open", 0)),
-                "high": float(row.get("high", 0)),
-                "low": float(row.get("low", 0)),
-                "close": float(row.get("close", 0)),
-                "volume": int(row.get("volume", 0)),
-            }
-        )
+    if isinstance(data, dict):
+        closes = data.get("close", [])
+        opens = data.get("open", [])
+        highs = data.get("high", [])
+        lows = data.get("low", [])
+        volumes = data.get("volume", [])
+        stamps = data.get("timestamp", data.get("start_Time", []))
+        for i in range(len(closes)):
+            bars.append(
+                {
+                    "timestamp": _epoch_to_iso(stamps[i]) if i < len(stamps) else "",
+                    "security_id": security_id,
+                    "open": float(opens[i]) if i < len(opens) else 0.0,
+                    "high": float(highs[i]) if i < len(highs) else 0.0,
+                    "low": float(lows[i]) if i < len(lows) else 0.0,
+                    "close": float(closes[i]),
+                    "volume": int(volumes[i]) if i < len(volumes) else 0,
+                }
+            )
+    elif isinstance(data, list):
+        for row in data:
+            bars.append(
+                {
+                    "timestamp": str(row.get("timestamp", row.get("start_Time", ""))),
+                    "security_id": security_id,
+                    "open": float(row.get("open", 0)),
+                    "high": float(row.get("high", 0)),
+                    "low": float(row.get("low", 0)),
+                    "close": float(row.get("close", 0)),
+                    "volume": int(row.get("volume", 0)),
+                }
+            )
     return bars
 
 
