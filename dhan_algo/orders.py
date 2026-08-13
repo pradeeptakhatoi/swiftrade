@@ -26,8 +26,13 @@ def place(
     trigger_price: float = 0.0,
     segment: str | None = None,
     settings: Settings | None = None,
+    is_exit: bool = False,
 ):
-    """Place an order with risk guards. Honors dry-run mode."""
+    """Place an order with risk guards. Honors dry-run mode.
+
+    ``is_exit=True`` marks a risk-reducing exit so the trading-halt guards are
+    skipped and the position can always be closed.
+    """
     settings = settings or get_settings()
     d_seg = segment or client.NSE
     txn = client.BUY if side.upper() == "BUY" else client.SELL
@@ -46,7 +51,9 @@ def place(
 
     # ---- risk guards ----
     ref_price = price if price > 0 else (ltp(client, security_id, d_seg) or 0)
-    block_reason = check_order(qty, ref_price, security_id, client, settings, side=side)
+    block_reason = check_order(
+        qty, ref_price, security_id, client, settings, side=side, is_exit=is_exit
+    )
     if block_reason:
         logger.warning("BLOCKED: %s", block_reason)
         journal_record(

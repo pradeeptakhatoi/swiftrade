@@ -94,6 +94,7 @@ def check_order(
     settings: Settings | None = None,
     *,
     side: str = "BUY",
+    is_exit: bool = False,
 ) -> str | None:
     """Return an error message if the order should be blocked, else None.
 
@@ -101,7 +102,14 @@ def check_order(
     halt apply to every order. The concurrent-position cap and consecutive-loss
     cooldown apply only to *opening* orders (``side="BUY"``) so that closing an
     existing position is never blocked.
+
+    ``is_exit=True`` marks a risk-reducing exit (e.g. from the live exit
+    manager): such orders skip every guard so a position can always be closed,
+    even during a daily-loss halt or when the position size exceeds MAX_QTY.
     """
+    if is_exit:
+        return None
+
     settings = settings or get_settings()
 
     if qty > settings.max_qty:

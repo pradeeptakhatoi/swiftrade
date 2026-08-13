@@ -6,13 +6,13 @@ import logging
 import threading
 import time
 from dataclasses import asdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from dhan_algo import analytics, journal
+from dhan_algo import analytics, journal, risk
 from dhan_algo.config import Settings
 from dhan_algo.client import get_client, ok
 from dhan_algo.market_data import ltp
@@ -24,6 +24,7 @@ from dhan_algo.backtest import TradingCosts, fetch_historical, load_csv, run_bac
 import yfinance as yf
 
 from exit_rules import ExitConfig
+from live_exit import LiveExitManager
 from intraday_scorer import score_single_intraday, score_universe_intraday
 from intraday_backtest import simulate_intraday_universe
 from swing_backtest import simulate_swing_universe
@@ -631,6 +632,91 @@ def _strategy_worker(
 
     strategy.on_stop()
     logger.info("Strategy stopped.")
+
+
+def _exit_manager_worker(
+    client,
+    manager: LiveExitManager,
+    interval: int,
+    segment: str | None,
+) -> None:
+    """Background thread that polls prices and fires managed exits.
+
+    On each loop it reads the broker's open positions to reconcile (drop any
+    position that was closed elsewhere), then feeds the latest price to the
+    exit manager and places a SELL for every exit action it returns. Exits use
+    ``is_exit=True`` so they are never blocked by a trading halt.
+    """
+    settings = _get_settings()
+    logger = logging.getLogger("exit_manager_worker")
+    logger.info("Exit manager started (interval=%ds)", interval)
+
+    def _log(msg: str) -> None:
+        st.session_state.setdefault("exit_mgr_log", []).append(
+            f"[{time.strftime('%H:%M:%S')}] {msg}"
+        )
+
+    while st.session_state.get("exit_mgr_running", False):
+        try:
+            open_ids: set[str] = set()
+            if settings.dhan_live:
+                for p in risk._positions(client):
+                    if risk._net_qty(p) > 0:
+                        open_ids.add(str(risk._security_id(p)))
+
+            for sid, tp in list(manager.positions.items()):
+                # Reconcile against the broker (live only): a position closed
+                # elsewhere should stop being tracked.
+                if settings.dhan_live and sid not in open_ids:
+                    manager.drop(sid)
+                    _log(f"{tp.symbol}: position closed externally, dropped")
+                    continue
+
+                price = ltp(client, sid, segment)
+                if price is None:
+                    continue
+
+                for action in manager.on_price(sid, price):
+                    place(
+                        client,
+                        sid,
+                        side="SELL",
+                        qty=action.qty,
+                        order_type="MARKET",
+                        product=tp.product,
+                        segment=segment,
+                        settings=settings,
+                        is_exit=True,
+                    )
+                    _log(
+                        f"EXIT {action.reason} {action.qty} {tp.symbol} "
+                        f"@ ~{price:.2f}"
+                    )
+                    if action.closed:
+                        pnl = manager.finalize(sid)
+                        journal.record_closed_trade(
+                            strategy="live",
+                            symbol=tp.symbol,
+                            entry_time=tp.pos["entry_time"],
+                            exit_time=datetime.now(timezone.utc).isoformat(),
+                            qty=tp.pos["qty"],
+                            entry_price=round(tp.pos["entry_fill"], 2),
+                            exit_price=round(pnl["avg_exit"], 2),
+                            exit_reason=action.reason,
+                            gross_pnl=round(pnl["gross"], 2),
+                            cost=round(pnl["cost"], 2),
+                            net_pnl=round(pnl["net"], 2),
+                            r_multiple=round(pnl["r_multiple"], 2),
+                        )
+                        _log(
+                            f"{tp.symbol}: closed net {pnl['net']:,.2f} "
+                            f"(logged to performance)"
+                        )
+        except Exception:
+            logger.exception("Error in exit manager tick")
+        time.sleep(interval)
+
+    logger.info("Exit manager stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -1582,6 +1668,145 @@ def page_performance() -> None:
         st.dataframe(df, width="stretch", hide_index=True)
 
 
+def _get_exit_manager() -> LiveExitManager:
+    """The shared exit manager for this session (created once)."""
+    mgr = st.session_state.get("exit_manager")
+    if mgr is None:
+        mgr = LiveExitManager()
+        st.session_state["exit_manager"] = mgr
+    return mgr
+
+
+def page_exit_manager() -> None:
+    st.caption(
+        "Actively manage open long positions with the same exit engine as the "
+        "backtests: hard stop, break-even, trailing stop, partial profit and "
+        "time stop. Register a position, start the monitor, and it places SELL "
+        "orders as rules trigger. Closed trades are logged to the Performance page."
+    )
+
+    settings = _get_settings()
+    if not settings.dhan_live:
+        st.info(
+            "Dry-run mode: exits are logged and journalled but not actually sent. "
+            "Set DHAN_LIVE=1 to place real exit orders.",
+            icon=":material/info:",
+        )
+
+    manager = _get_exit_manager()
+    running = st.session_state.get("exit_mgr_running", False)
+
+    # --- Register a position --------------------------------------------
+    with st.container(border=True):
+        st.subheader("Track a position", divider="gray")
+        reg_symbols = symbol_multiselect(
+            "Symbol", key="exitmgr_symbol", default=[],
+            help="Pick one symbol to manage.",
+        )
+        r1, r2, r3, r4, r5 = st.columns(5)
+        with r1:
+            reg_qty = st.number_input("Qty", min_value=1, value=1, step=1, key="exitmgr_qty")
+        with r2:
+            reg_entry = st.number_input("Entry", min_value=0.0, value=100.0, step=0.05, key="exitmgr_entry")
+        with r3:
+            reg_stop = st.number_input("Stop", min_value=0.0, value=98.0, step=0.05, key="exitmgr_stop")
+        with r4:
+            reg_target = st.number_input("Target", min_value=0.0, value=106.0, step=0.05, key="exitmgr_target")
+        with r5:
+            reg_product = st.selectbox("Product", ["INTRA", "CNC"], key="exitmgr_product")
+
+        reg_cfg = _exit_config_controls("exitmgr")
+
+        if st.button("Track position", key="exitmgr_add", type="primary"):
+            if not reg_symbols:
+                st.warning("Pick a symbol first.")
+            elif reg_stop >= reg_entry:
+                st.error("Stop must be below entry for a long position.")
+            else:
+                sym = reg_symbols[0]
+                try:
+                    client = _get_client()
+                    sid = resolve_security_id(client, sym)
+                except (SystemExit, Exception) as e:
+                    st.error(f"Could not resolve {sym}: {e}")
+                    sid = None
+                if sid is None:
+                    st.error(f"Could not resolve security id for {sym}.")
+                else:
+                    try:
+                        manager.register(
+                            sid, sym, entry=reg_entry, stop=reg_stop,
+                            target=reg_target, qty=int(reg_qty), cfg=reg_cfg,
+                            product=reg_product,
+                        )
+                        st.success(f"Now managing {sym} ({int(reg_qty)} @ {reg_entry}).")
+                    except ValueError as e:
+                        st.error(str(e))
+
+    # --- Monitor controls -----------------------------------------------
+    m1, m2, m3 = st.columns([1, 1, 1], vertical_alignment="bottom")
+    with m1:
+        mon_interval = st.number_input(
+            "Poll interval (s)", min_value=1, max_value=600,
+            value=settings.strategy_interval, key="exitmgr_interval",
+        )
+    with m2:
+        start_clicked = st.button(
+            "Start monitor", disabled=running or not manager.positions,
+            type="primary", width="stretch", icon=":material/play_arrow:",
+        )
+    with m3:
+        stop_clicked = st.button(
+            "Stop monitor", disabled=not running, width="stretch",
+            icon=":material/stop:",
+        )
+
+    if start_clicked:
+        try:
+            client = _get_client()
+        except (SystemExit, Exception) as e:
+            st.error(f"Client error: {e}")
+            return
+        st.session_state["exit_mgr_running"] = True
+        st.session_state["exit_mgr_log"] = []
+        thread = threading.Thread(
+            target=_exit_manager_worker,
+            args=(client, manager, int(mon_interval), None),
+            daemon=True,
+        )
+        thread.start()
+        st.session_state["exit_mgr_thread"] = thread
+        st.rerun()
+
+    if stop_clicked:
+        st.session_state["exit_mgr_running"] = False
+        st.rerun()
+
+    if running:
+        st.success("Monitor running", icon=":material/sensors:")
+    else:
+        st.info("Monitor stopped", icon=":material/pause:")
+
+    # --- Tracked positions + log ----------------------------------------
+    rows = manager.snapshot()
+    if rows:
+        st.caption("Managed positions")
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.info("No positions tracked yet. Register one above.")
+
+    st.caption("Exit log")
+    log_lines = st.session_state.get("exit_mgr_log", [])
+    if log_lines:
+        st.code("\n".join(log_lines[-50:]), language="text")
+    else:
+        st.info("No exits yet.")
+
+    if running:
+        time.sleep(2)
+        st.rerun()
+
+
 def page_kill_switch() -> None:
     st.warning(
         "Activating the kill switch will **disable all trading** on your Dhan account "
@@ -2523,6 +2748,7 @@ PAGES = {
     "Strategy": page_strategy,
     "Backtest": page_backtest,
     "Performance": page_performance,
+    "Exit Manager": page_exit_manager,
     "Trade Journal": page_journal,
     "Settings": page_settings,
     "Kill Switch": page_kill_switch,

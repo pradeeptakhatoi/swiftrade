@@ -194,3 +194,32 @@ class TestConsecutiveLosses:
             {"securityId": "3", "netQty": 0, "realizedProfit": -5},
         )
         assert consecutive_losses(mock_client) == 2
+
+
+class TestExitBypass:
+    def test_exit_skips_qty_guard(self, mock_client, test_settings):
+        test_settings.max_qty = 10
+        result = check_order(
+            qty=100, price=100.0, security_id="2885",
+            client=mock_client, settings=test_settings, is_exit=True,
+        )
+        assert result is None
+
+    def test_exit_skips_daily_loss_halt(self, mock_client, test_settings):
+        test_settings.max_daily_loss = 5_000
+        mock_client.get_positions.return_value = _positions(
+            {"securityId": "1", "netQty": 5, "realizedProfit": -9000},
+        )
+        result = check_order(
+            qty=1, price=100.0, security_id="1",
+            client=mock_client, settings=test_settings, side="SELL", is_exit=True,
+        )
+        assert result is None
+
+    def test_exit_does_not_query_positions(self, mock_client, test_settings):
+        # An exit short-circuits before any broker call.
+        check_order(
+            qty=1, price=100.0, security_id="1",
+            client=mock_client, settings=test_settings, is_exit=True,
+        )
+        mock_client.get_positions.assert_not_called()

@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from dhan_algo.orders import calculate_position_size, place_bracket, place_with_sl_target
+from dhan_algo.orders import (
+    calculate_position_size,
+    place,
+    place_bracket,
+    place_with_sl_target,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -196,3 +201,61 @@ class TestPlaceWithSlTarget:
         assert calls[0][1]["side"] == "SELL"   # entry
         assert calls[1][1]["side"] == "BUY"    # SL
         assert calls[2][1]["side"] == "BUY"    # target
+
+
+# ---------------------------------------------------------------------------
+# place(is_exit=...) — exits bypass the halt guards
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceExitBypass:
+    @patch("dhan_algo.orders.journal_record")
+    @patch("dhan_algo.orders.check_order")
+    def test_is_exit_passed_to_check_order(
+        self, mock_check, mock_journal, mock_client, test_settings
+    ):
+        mock_check.return_value = None
+        test_settings.dhan_live = False
+        place(
+            mock_client, "2885", side="SELL", qty=10,
+            order_type="MARKET", product="INTRA",
+            settings=test_settings, is_exit=True,
+        )
+        assert mock_check.call_args[1]["is_exit"] is True
+
+    @patch("dhan_algo.orders.journal_record")
+    def test_exit_not_blocked_under_daily_loss_halt(
+        self, mock_journal, mock_client, test_settings
+    ):
+        # A halt is active, but an exit still reaches the dry-run path.
+        test_settings.dhan_live = False
+        test_settings.max_daily_loss = 1_000
+        mock_client.get_positions.return_value = {
+            "status": "success",
+            "data": [{"securityId": "2885", "netQty": 5, "realizedProfit": -9999}],
+        }
+        result = place(
+            mock_client, "2885", side="SELL", qty=5,
+            order_type="MARKET", product="INTRA", price=100.0,
+            settings=test_settings, is_exit=True,
+        )
+        assert result is not None
+        assert result["status"] == "dry_run"
+
+    @patch("dhan_algo.orders.journal_record")
+    def test_entry_still_blocked_under_daily_loss_halt(
+        self, mock_journal, mock_client, test_settings
+    ):
+        # Same halt, but a normal (non-exit) order is blocked.
+        test_settings.dhan_live = False
+        test_settings.max_daily_loss = 1_000
+        mock_client.get_positions.return_value = {
+            "status": "success",
+            "data": [{"securityId": "2885", "netQty": 5, "realizedProfit": -9999}],
+        }
+        result = place(
+            mock_client, "2885", side="BUY", qty=5,
+            order_type="MARKET", product="INTRA", price=100.0,
+            settings=test_settings,
+        )
+        assert result is None
