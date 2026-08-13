@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     risk_per_trade: float = 0  # INR risk per trade; 0 = manual qty
     journal_path: str = "trades.csv"
     feed_mode: str = "poll"
+    default_data_source: str = "Dhan API"  # "Dhan API" or "Yahoo Finance"
 
 
 @lru_cache(maxsize=1)

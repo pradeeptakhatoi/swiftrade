@@ -14,6 +14,7 @@ import streamlit as st
 
 from dhan_algo import analytics, journal, risk
 from dhan_algo.config import Settings
+from dhan_algo.data_feed import fetch_universe
 from dhan_algo.client import get_client, ok
 from dhan_algo.market_data import ltp
 from dhan_algo.orders import calculate_position_size, place, place_bracket, place_with_sl_target
@@ -1023,6 +1024,51 @@ def _yf_to_bars(df: pd.DataFrame, symbol: str) -> list[dict]:
     return bars
 
 
+def _scanner_fetch(
+    symbols: list[str],
+    *,
+    interval: str,
+    period: str,
+    min_bars: int,
+    interval_minutes: int = 15,
+) -> dict[str, pd.DataFrame]:
+    """Fetch OHLCV frames for a scanner, honouring the data-source selector.
+
+    Dhan-first with automatic Yahoo fallback (per the configured default). A
+    short report of any fallbacks or skipped symbols is rendered inline.
+    """
+    source = st.session_state.get(
+        "data_source", _get_settings().default_data_source
+    )
+    client = None
+    if source == "Dhan API":
+        try:
+            client = _get_client()
+        except (SystemExit, Exception):
+            client = None
+
+    with st.spinner(f"Fetching {len(symbols)} symbols from {source}..."):
+        data, report = fetch_universe(
+            symbols,
+            source=source,
+            interval=interval,
+            period=period,
+            min_bars=min_bars,
+            client=client,
+            interval_minutes=interval_minutes,
+            pace=0.2,
+        )
+
+    if report.fell_back:
+        st.info(
+            f"Dhan unavailable for {len(report.fell_back)} symbol(s); used "
+            f"Yahoo fallback: {', '.join(report.fell_back)}"
+        )
+    if report.skipped:
+        st.caption(f"Skipped (insufficient data): {', '.join(report.skipped)}")
+    return data
+
+
 def _exit_config_controls(prefix: str, *, show_time_stop: bool = True) -> ExitConfig:
     """Render exit-management widgets and return the resulting ExitConfig.
 
@@ -1903,40 +1949,10 @@ def page_intraday() -> None:
             st.warning("Enter at least one symbol.")
             return
 
-        # Fetch intraday data via yfinance (batch download)
-        data: dict[str, pd.DataFrame] = {}
-        tickers_yf = [f"{sym}.NS" for sym in symbols]
-        yf_interval = f"{interval_minutes}m"
-        with st.spinner(f"Fetching intraday data for {len(symbols)} symbols..."):
-            try:
-                df_all = yf.download(
-                    tickers_yf, period="5d", interval=yf_interval,
-                    auto_adjust=True, group_by="ticker", threads=True,
-                )
-            except Exception as e:
-                st.error(f"Error fetching data: {e}")
-                return
-
-        if df_all is None or df_all.empty:
-            st.error("No data fetched for any symbol.")
-            return
-
-        multi = isinstance(df_all.columns, pd.MultiIndex)
-        for sym in symbols:
-            ticker_yf = f"{sym}.NS"
-            try:
-                df_bars = df_all[ticker_yf] if multi else df_all
-                df_bars = df_bars.dropna(how="all").reset_index()
-                for col in ("Open", "High", "Low", "Close", "Volume"):
-                    if col not in df_bars.columns:
-                        lc = col.lower()
-                        if lc in df_bars.columns:
-                            df_bars.rename(columns={lc: col}, inplace=True)
-                if len(df_bars) >= 5:
-                    data[sym] = df_bars
-            except (KeyError, Exception):
-                pass
-
+        data = _scanner_fetch(
+            symbols, interval="minute", period="5d",
+            min_bars=20, interval_minutes=interval_minutes,
+        )
         if not data:
             st.error("No data fetched for any symbol.")
             return
@@ -2213,39 +2229,9 @@ def page_swing() -> None:
             st.warning("Enter at least one symbol.")
             return
 
-        # Fetch daily data via yfinance (batch download)
-        data: dict[str, pd.DataFrame] = {}
-        tickers_yf = [f"{sym}.NS" for sym in symbols]
-        with st.spinner(f"Fetching daily data for {len(symbols)} symbols..."):
-            try:
-                df_all = yf.download(
-                    tickers_yf, period="1y",
-                    auto_adjust=True, group_by="ticker", threads=True,
-                )
-            except Exception as e:
-                st.error(f"Error fetching data: {e}")
-                return
-
-        if df_all is None or df_all.empty:
-            st.error("No data fetched for any symbol.")
-            return
-
-        multi = isinstance(df_all.columns, pd.MultiIndex)
-        for sym in symbols:
-            ticker_yf = f"{sym}.NS"
-            try:
-                df_bars = df_all[ticker_yf] if multi else df_all
-                df_bars = df_bars.dropna(how="all").reset_index()
-                for col in ("Open", "High", "Low", "Close", "Volume"):
-                    if col not in df_bars.columns:
-                        lc = col.lower()
-                        if lc in df_bars.columns:
-                            df_bars.rename(columns={lc: col}, inplace=True)
-                if len(df_bars) >= 220:
-                    data[sym] = df_bars
-            except (KeyError, Exception):
-                pass
-
+        data = _scanner_fetch(
+            symbols, interval="day", period="2y", min_bars=MIN_BARS,
+        )
         if not data:
             st.error("No data fetched for any symbol.")
             return
@@ -2496,38 +2482,9 @@ def page_tomorrow() -> None:
     params = {"atr_multiplier": st.session_state.get("tm_atr_mult", 1.5)}
 
     if st.session_state.get("tomorrow_do_scan"):
-        data: dict[str, pd.DataFrame] = {}
-        tickers_yf = [f"{sym}.NS" for sym in symbols]
-        with st.spinner(f"Fetching daily data for {len(symbols)} stocks..."):
-            try:
-                df_all = yf.download(
-                    tickers_yf, period="1y",
-                    auto_adjust=True, group_by="ticker", threads=True,
-                )
-            except Exception as e:
-                st.error(f"Error fetching data: {e}")
-                return
-
-        if df_all is None or df_all.empty:
-            st.error("No data fetched.")
-            return
-
-        multi = isinstance(df_all.columns, pd.MultiIndex)
-        for sym in symbols:
-            ticker_yf = f"{sym}.NS"
-            try:
-                df_bars = df_all[ticker_yf] if multi else df_all
-                df_bars = df_bars.dropna(how="all").reset_index()
-                for col in ("Open", "High", "Low", "Close", "Volume"):
-                    if col not in df_bars.columns:
-                        lc = col.lower()
-                        if lc in df_bars.columns:
-                            df_bars.rename(columns={lc: col}, inplace=True)
-                if len(df_bars) >= 220:
-                    data[sym] = df_bars
-            except (KeyError, Exception):
-                pass
-
+        data = _scanner_fetch(
+            symbols, interval="day", period="2y", min_bars=MIN_BARS,
+        )
         if not data:
             st.error("No data met the minimum bar requirement (220 daily bars).")
             return
@@ -2962,14 +2919,21 @@ else:
             "Navigation", list(PAGES.keys()), label_visibility="collapsed"
         )
 
+        _src_options = ["Yahoo Finance", "Dhan API"]
+        _src_default = (
+            settings.default_data_source
+            if settings.default_data_source in _src_options
+            else "Yahoo Finance"
+        )
         st.segmented_control(
             "Data source",
-            ["Yahoo Finance", "Dhan API"],
+            _src_options,
             key="data_source",
-            default="Yahoo Finance",
+            default=_src_default,
             help=(
-                "Yahoo Finance: free, ~15-min delayed, no login needed.\n"
-                "Dhan API: real-time, requires Dhan credentials."
+                "Dhan API: real-time, requires Dhan credentials (falls back to "
+                "Yahoo per-symbol if a fetch fails).\n"
+                "Yahoo Finance: free, ~15-min delayed, no login needed."
             ),
         )
 

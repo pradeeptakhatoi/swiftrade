@@ -225,22 +225,33 @@ def fetch_historical(
     interval: str = "day",
     segment: str = "NSE_EQ",
     exchange_token: str = "",
+    interval_minutes: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch OHLC bars via the DhanHQ ``HistoricalData`` API.
 
-    ``interval`` may be ``"day"`` or ``"minute"``.
+    ``interval`` may be ``"day"`` or ``"minute"``. For minute data,
+    *interval_minutes* (e.g. 1, 5, 15) selects the candle size when the
+    installed dhanhq version supports it; otherwise the default is used.
     """
     from dhanhq import HistoricalData
 
     hd = HistoricalData(client)
     if interval == "minute":
-        resp = hd.intraday_minute_data(
+        kwargs = dict(
             security_id=security_id,
             exchange_segment=segment,
             instrument_type="EQUITY",
             from_date=from_date,
             to_date=to_date,
         )
+        if interval_minutes:
+            try:
+                resp = hd.intraday_minute_data(interval=str(interval_minutes), **kwargs)
+            except TypeError:
+                # Older dhanhq without an ``interval`` parameter.
+                resp = hd.intraday_minute_data(**kwargs)
+        else:
+            resp = hd.intraday_minute_data(**kwargs)
     else:
         resp = hd.historical_daily_data(
             security_id=security_id,
