@@ -22,7 +22,9 @@ from dhan_algo.backtest import TradingCosts, fetch_historical, load_csv, run_bac
 import yfinance as yf
 
 from intraday_scorer import score_single_intraday, score_universe_intraday
+from intraday_backtest import simulate_intraday_universe
 from swing_scorer import score_single, score_universe
+from data.universe import ticker_display_name
 
 # ---------------------------------------------------------------------------
 # Stock universes — NIFTY 50 & NIFTY 100 constituents
@@ -55,6 +57,113 @@ NIFTY_NEXT_50: list[str] = [
 ]
 
 NIFTY_100: list[str] = NIFTY_50 + NIFTY_NEXT_50
+
+# ---------------------------------------------------------------------------
+# Symbol autosuggest — searchable NSE-equity symbol list from the security master
+# ---------------------------------------------------------------------------
+
+_SECURITY_CSV = "security_id_list.csv"
+
+
+@st.cache_data(show_spinner=False)
+def _symbol_master() -> tuple[list[str], dict[str, str]]:
+    """Return (sorted NSE-equity symbols, {symbol: company name}).
+
+    Reads the security master CSV, keeping only NSE cash-equity rows
+    (series EQ/BE). Falls back to the NIFTY 100 list if the CSV is missing
+    or unreadable.
+    """
+    try:
+        df = pd.read_csv(
+            _SECURITY_CSV,
+            usecols=[
+                "SEM_EXM_EXCH_ID",
+                "SEM_TRADING_SYMBOL",
+                "SEM_SERIES",
+                "SM_SYMBOL_NAME",
+            ],
+            dtype=str,
+        )
+        df = df[
+            (df["SEM_EXM_EXCH_ID"] == "NSE")
+            & (df["SEM_SERIES"].isin(["EQ", "BE"]))
+        ]
+        symbols = sorted(df["SEM_TRADING_SYMBOL"].dropna().unique().tolist())
+        names = dict(
+            zip(df["SEM_TRADING_SYMBOL"], df["SM_SYMBOL_NAME"].fillna(""))
+        )
+    except Exception:
+        symbols = list(NIFTY_100)
+        names = {s: ticker_display_name(s) for s in symbols}
+    if not symbols:
+        symbols = list(NIFTY_100)
+        names = {s: ticker_display_name(s) for s in symbols}
+    return symbols, names
+
+
+def _symbol_label(symbol: str) -> str:
+    """Format ``SYMBOL — Company Name`` for a dropdown entry."""
+    _, names = _symbol_master()
+    name = names.get(symbol) or ticker_display_name(symbol)
+    if name and name.upper() != symbol.upper():
+        return f"{symbol} — {name}"
+    return symbol
+
+
+def symbol_selectbox(
+    label: str,
+    key: str,
+    *,
+    default: str = "RELIANCE",
+    help: str | None = None,
+    container=st,
+) -> str:
+    """Searchable single-symbol picker that also accepts typed-in symbols."""
+    symbols, _ = _symbol_master()
+    options = list(symbols)
+    if default and default not in options:
+        options = [default, *options]
+    index = options.index(default) if default in options else None
+    choice = container.selectbox(
+        label,
+        options,
+        index=index,
+        key=key,
+        help=help,
+        format_func=_symbol_label,
+        accept_new_options=True,
+        placeholder="Type to search symbol or company…",
+    )
+    return (choice or "").strip().upper()
+
+
+def symbol_multiselect(
+    label: str,
+    key: str,
+    *,
+    default: list[str] | None = None,
+    help: str | None = None,
+    container=st,
+) -> list[str]:
+    """Searchable multi-symbol picker that also accepts typed-in symbols."""
+    symbols, _ = _symbol_master()
+    default = default or []
+    options = list(symbols)
+    for sym in default:
+        if sym not in options:
+            options.insert(0, sym)
+    chosen = container.multiselect(
+        label,
+        options,
+        default=default,
+        key=key,
+        help=help,
+        format_func=_symbol_label,
+        accept_new_options=True,
+        placeholder="Type to search symbols…",
+    )
+    return [s.strip().upper() for s in chosen if s and s.strip()]
+
 
 # ---------------------------------------------------------------------------
 # Logging capture — collect log records for in-app display
@@ -356,7 +465,10 @@ def page_dashboard() -> None:
 
 def page_market_data() -> None:
     mcol1, mcol2 = st.columns([3, 1], vertical_alignment="bottom")
-    symbol = mcol1.text_input("Symbol", value="RELIANCE", help="e.g. RELIANCE, TCS, INFY")
+    symbol = symbol_selectbox(
+        "Symbol", key="md_symbol",
+        help="Search by symbol or company name", container=mcol1,
+    )
     auto_refresh = mcol2.checkbox("Auto-refresh (5s)")
     data_source = st.session_state.get("data_source", "Yahoo Finance")
 
@@ -400,7 +512,7 @@ def page_place_order() -> None:
 
     with st.form("order_form", border=True):
         c1, c2, c3 = st.columns(3)
-        symbol = c1.text_input("Symbol", value="RELIANCE")
+        symbol = symbol_selectbox("Symbol", key="po_symbol", container=c1)
         side = c2.selectbox("Side", ["BUY", "SELL"])
         qty = c3.number_input("Qty", min_value=1, max_value=settings.max_qty, value=1)
         c4, c5, c6 = st.columns(3)
@@ -410,6 +522,9 @@ def page_place_order() -> None:
         submitted = st.form_submit_button("Place order", type="primary", width="stretch")
 
     if submitted:
+        if not symbol:
+            st.warning("Select a symbol first.")
+            return
         try:
             client = _get_client()
             sid = resolve_security_id(client, symbol)
@@ -489,7 +604,10 @@ def page_strategy() -> None:
 
     running = st.session_state.get("strategy_running", False)
 
-    symbols_input = st.text_input("Symbols (comma-separated)", value="RELIANCE, INFY")
+    strat_symbols = symbol_multiselect(
+        "Symbols", key="strat_symbols", default=["RELIANCE", "INFY"],
+        help="Search and add symbols to run the SMA strategy on",
+    )
     col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1], vertical_alignment="bottom")
     with col1:
         short_period = st.number_input("Short SMA", min_value=2, max_value=50, value=5)
@@ -515,7 +633,7 @@ def page_strategy() -> None:
             st.error(f"Client error: {e}")
             return
 
-        symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+        symbols = strat_symbols
         security_ids = []
         for sym in symbols:
             sid = resolve_security_id(client, sym)
@@ -576,7 +694,7 @@ def _yf_to_bars(df: pd.DataFrame, symbol: str) -> list[dict]:
 
 
 def page_backtest() -> None:
-    st.caption("Backtest — SMA crossover replay over historical data")
+    st.caption("Backtest — SMA replay & intraday signal trade simulation")
 
     with st.expander("Cost model (slippage + charges)", expanded=False):
         st.session_state.setdefault("bt_apply_costs", True)
@@ -599,10 +717,15 @@ def page_backtest() -> None:
             )
 
     data_source = st.session_state.get("data_source", "Yahoo Finance")
-    tab_fetch, tab_csv = st.tabs([f"Fetch from {data_source}", "Upload CSV"])
+    tab_fetch, tab_csv, tab_intra = st.tabs(
+        [f"Fetch from {data_source}", "Upload CSV", "Intraday simulation"]
+    )
 
     with tab_fetch:
-        symbols_input = st.text_input("Symbols (comma-separated)", value="RELIANCE", key="bt_symbols")
+        bt_symbols = symbol_multiselect(
+            "Symbols", key="bt_symbols", default=["RELIANCE"],
+            help="Search and add symbols to backtest",
+        )
         col1, col2, col3 = st.columns(3)
         with col1:
             from_date = st.date_input("From", value=date.today() - timedelta(days=90), key="bt_from")
@@ -612,7 +735,7 @@ def page_backtest() -> None:
             interval = st.selectbox("Interval", ["day", "minute"], key="bt_interval")
 
         if st.button(f"Run Backtest ({data_source})", key="bt_api_run"):
-            symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+            symbols = bt_symbols
             all_bars: dict[str, list] = {}
 
             if data_source == "Yahoo Finance":
@@ -697,6 +820,141 @@ def page_backtest() -> None:
                     st.warning("CSV produced no bars.")
             finally:
                 os.unlink(tmp_path)
+
+    with tab_intra:
+        st.caption(
+            "Simulate the intraday scanner's signals as real trades: enter long "
+            "on a high score, exit on ATR stop/target, square off at end of day."
+        )
+        itb_symbols = symbol_multiselect(
+            "Symbols", key="itb_symbols",
+            default=["RELIANCE", "TCS", "INFY"],
+            help="Search and add symbols to simulate",
+        )
+        ic1, ic2, ic3 = st.columns(3)
+        with ic1:
+            itf = st.selectbox("Interval", ["15m", "5m", "1m"], key="itb_interval")
+        with ic2:
+            ilookback = st.number_input(
+                "Lookback (days)", min_value=1, max_value=60, value=5, step=1,
+                key="itb_lookback",
+                help="Yahoo allows ~7d of 1m and ~60d of 5m/15m data.",
+            )
+        with ic3:
+            ithresh = st.slider(
+                "Entry score threshold", 0, 100, 70, 5, key="itb_threshold",
+                help="Enter only when the intraday composite score is at or above this.",
+            )
+        ic4, ic5 = st.columns(2)
+        with ic4:
+            iatr = st.number_input(
+                "Stop-loss ATR multiplier", min_value=0.5, max_value=3.0,
+                value=1.0, step=0.1, key="itb_atr_mult",
+            )
+        with ic5:
+            ireentry = st.checkbox(
+                "Allow re-entries same day", value=True, key="itb_reentry",
+            )
+
+        if st.button("Run intraday simulation", key="itb_run", type="primary"):
+            symbols = itb_symbols
+            if not symbols:
+                st.warning("Enter at least one symbol.")
+                return
+
+            interval_minutes = {"15m": 15, "5m": 5, "1m": 1}[itf]
+            period_days = min(int(ilookback), 7 if itf == "1m" else 60)
+            tickers_yf = [f"{sym}.NS" for sym in symbols]
+
+            with st.spinner(f"Fetching {itf} bars for {len(symbols)} symbols..."):
+                try:
+                    df_all = yf.download(
+                        tickers_yf, period=f"{period_days}d", interval=itf,
+                        auto_adjust=True, group_by="ticker", threads=True,
+                    )
+                except Exception as e:
+                    st.error(f"Yahoo Finance error: {e}")
+                    return
+
+            if df_all is None or df_all.empty:
+                st.error("No intraday data fetched.")
+                return
+
+            multi = isinstance(df_all.columns, pd.MultiIndex)
+            data: dict[str, pd.DataFrame] = {}
+            for sym in symbols:
+                ticker_yf = f"{sym}.NS"
+                try:
+                    df_bars = df_all[ticker_yf] if multi else df_all
+                    df_bars = df_bars.dropna(how="all").reset_index()
+                    for col in ("Open", "High", "Low", "Close", "Volume"):
+                        if col not in df_bars.columns:
+                            lc = col.lower()
+                            if lc in df_bars.columns:
+                                df_bars.rename(columns={lc: col}, inplace=True)
+                    if len(df_bars) >= 21:
+                        data[sym] = df_bars
+                    else:
+                        st.warning(f"Not enough bars for {sym}")
+                except (KeyError, Exception) as e:
+                    st.warning(f"Skipped {sym}: {e}")
+
+            if not data:
+                st.error("No symbols had enough intraday data.")
+                return
+
+            apply_costs = st.session_state.get("bt_apply_costs", True)
+            costs = (
+                TradingCosts(slippage_pct=st.session_state.get("bt_slippage_bps", 5.0) / 10000.0)
+                if apply_costs else None
+            )
+            params = {"interval_minutes": interval_minutes, "atr_multiplier": iatr}
+
+            with st.spinner("Simulating trades..."):
+                result = simulate_intraday_universe(
+                    data, params=params, score_threshold=float(ithresh),
+                    costs=costs, product="INTRA", allow_reentry=ireentry,
+                )
+            st.session_state["itb_result"] = result
+
+        result = st.session_state.get("itb_result")
+        if result is not None:
+            _display_intraday_sim(result)
+
+
+def _display_intraday_sim(result) -> None:
+    if result.total_trades == 0:
+        st.info(
+            "No trades were triggered. Lower the entry score threshold or widen "
+            "the lookback / interval."
+        )
+        return
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades", result.total_trades)
+        c2.metric("Win rate", f"{result.win_rate:.0f}%")
+        c3.metric("Avg R", f"{result.avg_r:.2f}")
+        pf = result.profit_factor
+        c4.metric("Profit factor", "inf" if pf == float("inf") else f"{pf:.2f}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Gross P&L", f"{result.gross_pnl:,.0f}")
+        c6.metric("Costs", f"{result.total_costs:,.0f}")
+        c7.metric(
+            "Net P&L", f"{result.net_pnl:,.0f}",
+            delta=f"{result.expectancy:,.1f}/trade",
+        )
+        c8.metric("Max drawdown", f"{result.max_drawdown:,.0f}")
+
+    curve = result.equity_curve
+    if curve:
+        st.caption("Equity curve (cumulative net P&L)")
+        st.line_chart(pd.DataFrame({"Net P&L": curve}), height=200)
+
+    st.caption("Trades")
+    trades_df = pd.DataFrame([asdict(t) for t in result.trades])
+    st.dataframe(trades_df, width="stretch", hide_index=True)
 
 
 def _run_and_display_backtest(all_bars: dict[str, list]) -> None:
@@ -833,11 +1091,11 @@ def sidebar_intraday() -> None:
         help="Pre-built universe or enter your own symbols",
     )
     if universe == "Custom":
-        st.text_input(
-            "Symbols (comma-separated)",
-            value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
-            key="intra_symbols",
+        chosen = symbol_multiselect(
+            "Symbols", key="intra_symbols_ms",
+            default=["RELIANCE", "TCS", "INFY", "HDFCBANK", "SBIN"],
         )
+        st.session_state["intra_symbols"] = ", ".join(chosen)
     else:
         symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
         st.session_state["intra_symbols"] = ", ".join(symbol_list)
@@ -1110,11 +1368,11 @@ def sidebar_swing() -> None:
         help="Pre-built universe or enter your own symbols",
     )
     if universe == "Custom":
-        st.text_input(
-            "Symbols (comma-separated)",
-            value="RELIANCE, TCS, INFY, HDFCBANK, SBIN",
-            key="swing_symbols",
+        chosen = symbol_multiselect(
+            "Symbols", key="swing_symbols_ms",
+            default=["RELIANCE", "TCS", "INFY", "HDFCBANK", "SBIN"],
         )
+        st.session_state["swing_symbols"] = ", ".join(chosen)
     else:
         symbol_list = NIFTY_50 if universe == "NIFTY 50" else NIFTY_100
         st.session_state["swing_symbols"] = ", ".join(symbol_list)
