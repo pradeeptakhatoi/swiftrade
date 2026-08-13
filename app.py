@@ -2733,6 +2733,191 @@ def page_settings() -> None:
     )
 
 
+def page_learn() -> None:
+    st.caption(
+        "How SwiftTrade trades each style: the signals each scanner scores, the "
+        "ATR-based stop/target setups, exit rules, product types and how to "
+        "backtest before risking capital."
+    )
+
+    tab_intraday, tab_swing, tab_long, tab_data = st.tabs(
+        ["Intraday", "Swing", "Long term", "Which data source?"]
+    )
+
+    with tab_intraday:
+        st.subheader("Intraday — same-day round trips")
+        st.markdown(
+            "Enter and exit within the session; nothing is carried overnight. "
+            "Trades use the **INTRA** product, which the broker squares off at "
+            "the end of the day if you don't."
+        )
+        st.markdown("**What the Intraday Scanner scores**")
+        st.markdown(
+            "The composite score is a weighted average of five sub-scores on "
+            "1/5/15-minute candles:"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Signal": "VWAP", "Weight": 1.0,
+                     "Reads": "Price vs volume-weighted average — intraday bias"},
+                    {"Signal": "SuperTrend", "Weight": 1.0,
+                     "Reads": "ATR-band trend flip — direction & regime"},
+                    {"Signal": "Momentum", "Weight": 1.5,
+                     "Reads": "RSI(7) + MACD(5,13,3) — strongest weight"},
+                    {"Signal": "Volume", "Weight": 0.5,
+                     "Reads": "Participation vs recent average"},
+                    {"Signal": "ORB", "Weight": 1.0,
+                     "Reads": "Opening-range breakout"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        st.markdown(
+            "Fast indicator settings (RSI **7**, MACD **5/13/3**, ATR **7**) so "
+            "signals react within the session. Needs only **20 bars** of warmup."
+        )
+        st.markdown("**Trade setup (ATR-based)**")
+        st.markdown(
+            "- Stop = entry − **1.0 × ATR** (tight, intraday volatility)\n"
+            "- Target 1 = **+1.5R**, Target 2 = **+2.5R** (R = entry − stop)\n"
+            "- Exits managed live by the **Exit Manager** — break-even, trailing "
+            "stop, partial profit and a **max-hold** bar cap for EOD square-off."
+        )
+        st.markdown("**How to practise it**")
+        st.markdown(
+            "Run the **Intraday Scanner** for ranked candidates, then the "
+            "intraday simulation on the **Backtest** page to see how the same "
+            "scores + setup would have performed. Save results to the "
+            "**Performance** page to track expectancy."
+        )
+        st.info(
+            "Intraday needs **real-time** data — a 15-minute delayed feed makes "
+            "VWAP/ORB stale. See the **Which data source?** tab.",
+            icon="⚠️",
+        )
+
+    with tab_swing:
+        st.subheader("Swing — multi-day holds")
+        st.markdown(
+            "Hold positions for days to a few weeks to capture a trend leg. "
+            "Uses the **CNC** (delivery) product so positions carry across days."
+        )
+        st.markdown("**What the Swing Scanner scores**")
+        st.markdown(
+            "Weighted average of five sub-scores on the **daily** timeframe:"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Signal": "Trend", "Weight": 1.0,
+                     "Reads": "EMA stack / 200-EMA slope — primary direction"},
+                    {"Signal": "Momentum", "Weight": 1.0,
+                     "Reads": "RSI(14) + MACD(12,26,9)"},
+                    {"Signal": "Volume", "Weight": 0.8,
+                     "Reads": "Accumulation vs average"},
+                    {"Signal": "Breakout", "Weight": 0.8,
+                     "Reads": "Proximity to recent range highs"},
+                    {"Signal": "Volatility", "Weight": 0.5,
+                     "Reads": "ATR regime — favours orderly expansion"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        st.markdown(
+            "Standard settings (RSI **14**, MACD **12/26/9**, ATR **14**). Needs "
+            "**220 bars** so the 200-EMA trend filter is fully warmed up."
+        )
+        st.markdown("**Trade setup (ATR-based)**")
+        st.markdown(
+            "- Stop = entry − **1.5 × ATR** (wider, to survive daily noise)\n"
+            "- Target 1 = **+2R**, Target 2 = **+3R**\n"
+            "- Exit rules add break-even, trailing and partials; `max_hold_bars` "
+            "caps the hold in trading days."
+        )
+        st.markdown("**How to practise it**")
+        st.markdown(
+            "Use the **Swing Scanner** and **Tomorrow's Picks**, then the swing "
+            "simulation on the **Backtest** page over a long history to validate "
+            "the edge before committing capital."
+        )
+
+    with tab_long:
+        st.subheader("Long term — position / investing horizon")
+        st.markdown(
+            "SwiftTrade has **no dedicated long-term scanner** — it's built for "
+            "intraday and swing. You can still apply it to a long horizon with a "
+            "few adjustments, framed honestly:"
+        )
+        st.markdown(
+            "- **Product: CNC** (delivery) — you own the shares, no square-off.\n"
+            "- **Filter on the daily trend / 200-EMA** — the Swing Scanner's "
+            "*trend* sub-score is the closest built-in tool; treat only "
+            "strong-trend names as candidates.\n"
+            "- **Backtest over 10 years** of daily history to judge a long-hold "
+            "approach, not a few months.\n"
+            "- **Size with capital awareness** — `trading_capital` and "
+            "`max_position_pct` keep any single position within your risk "
+            "budget.\n"
+            "- **Expect low turnover** — you're acting on weekly/monthly closes, "
+            "so wider stops and patience matter more than fast signals."
+        )
+        st.info(
+            "Because there's no purpose-built long-term engine, treat this as "
+            "'swing tools stretched to a longer horizon' rather than a distinct "
+            "strategy the toolkit optimises for.",
+            icon="ℹ️",
+        )
+
+    with tab_data:
+        st.subheader("Which data source should I trade on?")
+        st.markdown(
+            "**Don't place live trades off Yahoo Finance. Use Dhan's feed for "
+            "anything that touches real money.**"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Aspect": "Latency",
+                     "Yahoo Finance": "~15-min delayed",
+                     "Dhan API": "Real-time tick / LTP"},
+                    {"Aspect": "Reliability",
+                     "Yahoo Finance": "Unofficial, breaks without notice",
+                     "Dhan API": "Official, SLA-backed"},
+                    {"Aspect": "Intraday history",
+                     "Yahoo Finance": "1-min ~last 7 days, gappy",
+                     "Dhan API": "Full intraday depth"},
+                    {"Aspect": "Cost",
+                     "Yahoo Finance": "Free",
+                     "Dhan API": "Data subscription for live feed"},
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        st.markdown("**Rule of thumb by style**")
+        st.markdown(
+            "- **Intraday → Dhan real-time, no exception.** Delayed data makes "
+            "VWAP/ORB and live stops worthless.\n"
+            "- **Swing → Yahoo is acceptable** for scanning and planning (you act "
+            "at next open / on a limit), but confirm the live price via Dhan "
+            "before the order goes in.\n"
+            "- **Long term → Yahoo is fine.** You act on daily/weekly closes, so "
+            "a delay is just noise.\n"
+            "- **Backtesting → Yahoo is fine and cheaper.** Its NSE intraday "
+            "history is shallow (~7 days of 1-min), so long intraday backtests "
+            "need Dhan or a CSV upload."
+        )
+        st.warning(
+            "Even for swing/long-term, Yahoo's NSE adjustment quirks can subtly "
+            "inflate backtests. Before committing real capital on a backtested "
+            "edge, re-run the critical part on Dhan or a clean CSV.",
+            icon="⚠️",
+        )
+
+
 # ---------------------------------------------------------------------------
 # App layout
 # ---------------------------------------------------------------------------
@@ -2750,6 +2935,7 @@ PAGES = {
     "Performance": page_performance,
     "Exit Manager": page_exit_manager,
     "Trade Journal": page_journal,
+    "Learn": page_learn,
     "Settings": page_settings,
     "Kill Switch": page_kill_switch,
 }
