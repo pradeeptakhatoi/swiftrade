@@ -1270,6 +1270,7 @@ def page_intraday() -> None:
     # Position sizing info
     _entry_default = round(entry if entry > 0 else row["price"], 2)
     _sl_default = round(sl, 2) if sl > 0 else round(row["price"] * 0.99, 2)
+    _target_default = round(t1, 2) if t1 > 0 else round(row["price"] * 1.01, 2)
     _risk_per_share = abs(_entry_default - _sl_default)
 
     if settings.risk_per_trade > 0 and _risk_per_share > 0.01:
@@ -1285,6 +1286,16 @@ def page_intraday() -> None:
     else:
         auto_qty = 1
 
+    # Refresh the order-form fields when the selected symbol changes. Keyed
+    # widgets keep their value in session_state, so the value= defaults are
+    # ignored on rerun — update session_state before the widgets are built.
+    if st.session_state.get("intra_form_ticker") != selected_ticker:
+        st.session_state["intra_form_ticker"] = selected_ticker
+        st.session_state["intra_qty"] = max(auto_qty, 1)
+        st.session_state["intra_entry_price"] = _entry_default
+        st.session_state["intra_sl_price"] = _sl_default
+        st.session_state["intra_target_price"] = _target_default
+
     with st.form("intra_order_form", border=True):
         st.caption(f"Bracket order for {selected_ticker} (entry + SL + target)")
         fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
@@ -1295,14 +1306,12 @@ def page_intraday() -> None:
                 "Qty",
                 min_value=1,
                 max_value=settings.max_qty,
-                value=max(auto_qty, 1),
                 key="intra_qty",
             )
         with fcol3:
             entry_price = st.number_input(
                 "Entry",
                 min_value=0.01,
-                value=_entry_default,
                 step=0.05,
                 key="intra_entry_price",
             )
@@ -1310,7 +1319,6 @@ def page_intraday() -> None:
             sl_price = st.number_input(
                 "Stop loss",
                 min_value=0.01,
-                value=_sl_default,
                 step=0.05,
                 key="intra_sl_price",
             )
@@ -1318,7 +1326,6 @@ def page_intraday() -> None:
             target_price = st.number_input(
                 "Target",
                 min_value=0.01,
-                value=round(t1, 2) if t1 > 0 else round(row["price"] * 1.01, 2),
                 step=0.05,
                 key="intra_target_price",
             )
@@ -1536,6 +1543,7 @@ def page_swing() -> None:
 
     _sw_entry_default = round(row.get("entry", row["price"]), 2)
     _sw_sl_default = round(row.get("stop_loss", row["price"] * 0.97), 2)
+    _sw_target_default = round(row.get("target1", row["price"] * 1.05), 2)
     _sw_risk_per_share = abs(_sw_entry_default - _sw_sl_default)
 
     if settings.risk_per_trade > 0 and _sw_risk_per_share > 0.01:
@@ -1551,6 +1559,15 @@ def page_swing() -> None:
     else:
         sw_auto_qty = 1
 
+    # Refresh the order-form fields when the selected symbol changes (keyed
+    # widgets otherwise retain the previous symbol's values across reruns).
+    if st.session_state.get("sw_form_ticker") != selected_ticker:
+        st.session_state["sw_form_ticker"] = selected_ticker
+        st.session_state["sw_qty"] = max(sw_auto_qty, 1)
+        st.session_state["sw_price"] = _sw_entry_default
+        st.session_state["sw_sl_price"] = _sw_sl_default
+        st.session_state["sw_target_price"] = _sw_target_default
+
     with st.form("swing_order_form", border=True):
         st.caption(f"Place order for {selected_ticker} (entry + SL + target)")
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
@@ -1564,24 +1581,23 @@ def page_swing() -> None:
         with r1c4:
             qty = st.number_input(
                 "Qty", min_value=1, max_value=settings.max_qty,
-                value=max(sw_auto_qty, 1), key="sw_qty",
+                key="sw_qty",
             )
 
         r2c1, r2c2, r2c3, r2c4 = st.columns([1, 1, 1, 1])
         with r2c1:
             limit_price = st.number_input(
-                "Entry", min_value=0.0, value=_sw_entry_default,
+                "Entry", min_value=0.0,
                 step=0.05, key="sw_price",
             )
         with r2c2:
             sw_sl = st.number_input(
-                "Stop loss", min_value=0.0, value=_sw_sl_default,
+                "Stop loss", min_value=0.0,
                 step=0.05, key="sw_sl_price",
             )
         with r2c3:
             sw_target = st.number_input(
                 "Target", min_value=0.0,
-                value=round(row.get("target1", row["price"] * 1.05), 2),
                 step=0.05, key="sw_target_price",
             )
         with r2c4:
