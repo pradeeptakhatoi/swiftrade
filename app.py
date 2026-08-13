@@ -24,7 +24,8 @@ import yfinance as yf
 
 from intraday_scorer import score_single_intraday, score_universe_intraday
 from intraday_backtest import simulate_intraday_universe
-from swing_scorer import score_single, score_universe
+from swing_backtest import simulate_swing_universe
+from swing_scorer import MIN_BARS, score_single, score_universe
 from data.universe import ticker_display_name
 
 # ---------------------------------------------------------------------------
@@ -941,8 +942,9 @@ def page_backtest() -> None:
             )
 
     data_source = st.session_state.get("data_source", "Yahoo Finance")
-    tab_fetch, tab_csv, tab_intra = st.tabs(
-        [f"Fetch from {data_source}", "Upload CSV", "Intraday simulation"]
+    tab_fetch, tab_csv, tab_intra, tab_swing = st.tabs(
+        [f"Fetch from {data_source}", "Upload CSV",
+         "Intraday simulation", "Swing simulation"]
     )
 
     with tab_fetch:
@@ -1142,6 +1144,113 @@ def page_backtest() -> None:
             st.session_state["itb_result"] = result
 
         result = st.session_state.get("itb_result")
+        if result is not None:
+            _display_intraday_sim(result)
+
+    with tab_swing:
+        st.caption(
+            "Simulate the swing scanner's signals as real trades on daily bars: "
+            "enter long on a high score, exit on ATR stop/target, hold across "
+            "days until an optional max-hold cap or the end of data."
+        )
+        stb_symbols = symbol_multiselect(
+            "Symbols", key="stb_symbols",
+            default=["RELIANCE", "TCS", "INFY"],
+            help="Search and add symbols to simulate",
+        )
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            syears = st.selectbox(
+                "History", ["2y", "5y", "10y"], key="stb_years",
+                help="Daily lookback window. More history = more trades.",
+            )
+        with sc2:
+            sthresh = st.slider(
+                "Entry score threshold", 0, 100, 60, 5, key="stb_threshold",
+                help="Enter only when the swing composite score is at or above this.",
+            )
+        with sc3:
+            smaxhold = st.number_input(
+                "Max hold (bars, 0 = none)", min_value=0, max_value=250,
+                value=0, step=5, key="stb_maxhold",
+                help="Force-close a trade after this many daily bars. 0 disables.",
+            )
+        sc4, sc5 = st.columns(2)
+        with sc4:
+            satr = st.number_input(
+                "Stop-loss ATR multiplier", min_value=0.5, max_value=3.0,
+                value=1.5, step=0.1, key="stb_atr_mult",
+            )
+        with sc5:
+            sreentry = st.checkbox(
+                "Allow re-entries", value=True, key="stb_reentry",
+                help="Take another trade after a prior one closes on the same symbol.",
+            )
+
+        if st.button("Run swing simulation", key="stb_run", type="primary"):
+            symbols = stb_symbols
+            if not symbols:
+                st.warning("Enter at least one symbol.")
+                return
+
+            tickers_yf = [f"{sym}.NS" for sym in symbols]
+            with st.spinner(f"Fetching {syears} daily bars for {len(symbols)} symbols..."):
+                try:
+                    df_all = yf.download(
+                        tickers_yf, period=syears, interval="1d",
+                        auto_adjust=True, group_by="ticker", threads=True,
+                    )
+                except Exception as e:
+                    st.error(f"Yahoo Finance error: {e}")
+                    return
+
+            if df_all is None or df_all.empty:
+                st.error("No daily data fetched.")
+                return
+
+            multi = isinstance(df_all.columns, pd.MultiIndex)
+            data: dict[str, pd.DataFrame] = {}
+            for sym in symbols:
+                ticker_yf = f"{sym}.NS"
+                try:
+                    df_bars = df_all[ticker_yf] if multi else df_all
+                    df_bars = df_bars.dropna(how="all").reset_index()
+                    for col in ("Open", "High", "Low", "Close", "Volume"):
+                        if col not in df_bars.columns:
+                            lc = col.lower()
+                            if lc in df_bars.columns:
+                                df_bars.rename(columns={lc: col}, inplace=True)
+                    if len(df_bars) >= MIN_BARS + 1:
+                        data[sym] = df_bars
+                    else:
+                        st.warning(
+                            f"Not enough daily history for {sym} "
+                            f"(need > {MIN_BARS} bars)."
+                        )
+                except (KeyError, Exception) as e:
+                    st.warning(f"Skipped {sym}: {e}")
+
+            if not data:
+                st.error("No symbols had enough daily data.")
+                return
+
+            apply_costs = st.session_state.get("bt_apply_costs", True)
+            costs = (
+                TradingCosts(slippage_pct=st.session_state.get("bt_slippage_bps", 5.0) / 10000.0)
+                if apply_costs else None
+            )
+            params = {"atr_multiplier": satr}
+            max_hold = int(smaxhold) or None
+
+            with st.spinner("Simulating swing trades..."):
+                result = simulate_swing_universe(
+                    data, params=params, score_threshold=float(sthresh),
+                    costs=costs, product="CNC", max_hold_bars=max_hold,
+                    allow_reentry=sreentry,
+                )
+            st.session_state["stb_result"] = result
+
+        result = st.session_state.get("stb_result")
         if result is not None:
             _display_intraday_sim(result)
 
