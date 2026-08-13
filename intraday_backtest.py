@@ -31,6 +31,7 @@ from typing import Any, Iterator
 import pandas as pd
 
 from dhan_algo.backtest import TradingCosts
+from exit_rules import ExitConfig, finalize_long, open_long, step_long
 from indicators import compute_intraday
 from indicators.orb import score as orb_score
 from indicators.supertrend import score as supertrend_score
@@ -237,16 +238,22 @@ def simulate_intraday(
     costs: TradingCosts | None = None,
     product: str = "INTRA",
     allow_reentry: bool = True,
+    exit_config: ExitConfig | None = None,
 ) -> IntradayBacktestResult:
     """Simulate long-only intraday trades for one symbol.
 
     *df* holds intraday OHLCV bars (columns ``Open, High, Low, Close, Volume``)
     plus a datetime column (``Datetime``/``Date``) or index used to split days.
+
+    *exit_config* enables optional exit-management rules (break-even, trailing
+    stop, partial profit, time stop) applied within each session; when omitted
+    only the plain ATR stop/target and end-of-day square-off apply.
     """
     weights = weights or dict(DEFAULT_WEIGHTS)
     params = params or {}
     interval_minutes = int(params.get("interval_minutes", 15))
     atr_multiplier = float(params.get("atr_multiplier", 1.0))
+    cfg = exit_config or ExitConfig()
 
     result = IntradayBacktestResult()
 
@@ -266,19 +273,14 @@ def simulate_intraday(
         for i in range(n):
             # 1) Manage an open position on this bar.
             if pos is not None:
-                raw_exit = None
-                reason = ""
-                if lows[i] <= pos["stop"]:
-                    raw_exit, reason = pos["stop"], "stop"
-                elif highs[i] >= pos["target"]:
-                    raw_exit, reason = pos["target"], "target"
-                elif i == last_idx:
-                    raw_exit, reason = closes[i], "eod"
-
-                if raw_exit is not None:
+                closed, reason = step_long(
+                    pos, highs[i], lows[i], closes[i], i,
+                    is_last=(i == last_idx), cfg=cfg, end_reason="eod",
+                )
+                if closed:
                     result.trades.append(
                         _close_trade(
-                            symbol, pos, raw_exit, reason,
+                            symbol, pos, reason,
                             _row_time(session.iloc[i], i), qty, costs, product,
                         )
                     )
@@ -300,15 +302,17 @@ def simulate_intraday(
                             entry_fill = (
                                 costs.slippage_price("BUY", entry_raw) if costs else entry_raw
                             )
-                            pos = {
-                                "entry_fill": entry_fill,
-                                "stop": stop,
-                                "target": target,
-                                "entry_time": _row_time(session.iloc[i], i),
-                                "entry_charge": (
+                            pos = open_long(
+                                entry_fill=entry_fill,
+                                stop=stop,
+                                target=target,
+                                entry_idx=i,
+                                entry_time=_row_time(session.iloc[i], i),
+                                qty=qty,
+                                entry_charge=(
                                     costs.total("BUY", entry_fill, qty, product) if costs else 0.0
                                 ),
-                            }
+                            )
                             traded_today = True
 
     return result
@@ -317,37 +321,27 @@ def simulate_intraday(
 def _close_trade(
     symbol: str,
     pos: dict[str, Any],
-    raw_exit: float,
     reason: str,
     exit_time: str,
     qty: int,
     costs: TradingCosts | None,
     product: str,
 ) -> IntradayTrade:
-    entry_fill = pos["entry_fill"]
-    exit_fill = costs.slippage_price("SELL", raw_exit) if costs else raw_exit
-    exit_charge = costs.total("SELL", exit_fill, qty, product) if costs else 0.0
-    cost = pos["entry_charge"] + exit_charge
-
-    gross = (exit_fill - entry_fill) * qty
-    net = gross - cost
-    risk = entry_fill - pos["stop"]
-    r_mult = (exit_fill - entry_fill) / risk if risk > 0 else 0.0
-
+    pnl = finalize_long(pos, costs, product)
     return IntradayTrade(
         symbol=symbol,
         entry_time=pos["entry_time"],
         exit_time=exit_time,
         qty=qty,
-        entry_price=round(entry_fill, 2),
-        exit_price=round(exit_fill, 2),
-        stop=round(pos["stop"], 2),
+        entry_price=round(pos["entry_fill"], 2),
+        exit_price=round(pnl["avg_exit"], 2),
+        stop=round(pos["initial_stop"], 2),
         target=round(pos["target"], 2),
         exit_reason=reason,
-        gross_pnl=round(gross, 2),
-        cost=round(cost, 2),
-        net_pnl=round(net, 2),
-        r_multiple=round(r_mult, 2),
+        gross_pnl=round(pnl["gross"], 2),
+        cost=round(pnl["cost"], 2),
+        net_pnl=round(pnl["net"], 2),
+        r_multiple=round(pnl["r_multiple"], 2),
     )
 
 
@@ -361,6 +355,7 @@ def simulate_intraday_universe(
     costs: TradingCosts | None = None,
     product: str = "INTRA",
     allow_reentry: bool = True,
+    exit_config: ExitConfig | None = None,
     progress_cb=None,
 ) -> IntradayBacktestResult:
     """Run :func:`simulate_intraday` over many symbols and merge the trades.
@@ -375,6 +370,7 @@ def simulate_intraday_universe(
                 symbol, df, weights, params,
                 score_threshold=score_threshold, qty=qty,
                 costs=costs, product=product, allow_reentry=allow_reentry,
+                exit_config=exit_config,
             )
             merged.trades.extend(res.trades)
         except Exception:

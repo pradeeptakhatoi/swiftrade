@@ -22,6 +22,7 @@ from dhan_algo.strategy import Order, PollingTicker, SmaDemoMulti
 from dhan_algo.backtest import TradingCosts, fetch_historical, load_csv, run_backtest
 import yfinance as yf
 
+from exit_rules import ExitConfig
 from intraday_scorer import score_single_intraday, score_universe_intraday
 from intraday_backtest import simulate_intraday_universe
 from swing_backtest import simulate_swing_universe
@@ -935,6 +936,60 @@ def _yf_to_bars(df: pd.DataFrame, symbol: str) -> list[dict]:
     return bars
 
 
+def _exit_config_controls(prefix: str, *, show_time_stop: bool = True) -> ExitConfig:
+    """Render exit-management widgets and return the resulting ExitConfig.
+
+    Rules are opt-in: with everything at 0 the simulation uses the plain
+    ATR stop/target ladder. *prefix* namespaces the widget keys so the same
+    controls can appear in more than one tab.
+    """
+    with st.expander("Exit management (optional)", expanded=False):
+        st.caption(
+            "Layer break-even, trailing, partial-profit and time exits on top "
+            "of the ATR stop/target. R = the trade's initial risk (entry − stop)."
+        )
+        e1, e2 = st.columns(2)
+        with e1:
+            breakeven_r = st.number_input(
+                "Break-even after (R)", min_value=0.0, max_value=10.0, step=0.25,
+                value=0.0, key=f"{prefix}_be_r",
+                help="Move the stop to entry once price is this many R in profit. 0 = off.",
+            )
+        with e2:
+            trail_r = st.number_input(
+                "Trailing stop (R below high)", min_value=0.0, max_value=10.0, step=0.25,
+                value=0.0, key=f"{prefix}_trail_r",
+                help="Trail the stop this many R below the highest high since entry. 0 = off.",
+            )
+        e3, e4 = st.columns(2)
+        with e3:
+            partial_r = st.number_input(
+                "Partial profit at (R)", min_value=0.0, max_value=10.0, step=0.25,
+                value=0.0, key=f"{prefix}_partial_r",
+                help="Sell part of the position at this many R. 0 = off.",
+            )
+        with e4:
+            partial_pct = st.slider(
+                "Partial size (%)", 0, 90, 0, 5, key=f"{prefix}_partial_pct",
+                help="Fraction of the position sold at the partial level.",
+            )
+        max_hold = 0
+        if show_time_stop:
+            max_hold = st.number_input(
+                "Time stop (bars, 0 = none)", min_value=0, max_value=500,
+                value=0, step=1, key=f"{prefix}_max_hold",
+                help="Force-close a trade after this many bars.",
+            )
+
+    return ExitConfig(
+        breakeven_r=float(breakeven_r),
+        trail_r=float(trail_r),
+        partial_r=float(partial_r),
+        partial_pct=float(partial_pct) / 100.0,
+        max_hold_bars=int(max_hold) or None,
+    )
+
+
 def page_backtest() -> None:
     st.caption("Backtest — SMA replay & intraday signal trade simulation")
 
@@ -1099,6 +1154,8 @@ def page_backtest() -> None:
                 "Allow re-entries same day", value=True, key="itb_reentry",
             )
 
+        itb_exit_cfg = _exit_config_controls("itb")
+
         if st.button("Run intraday simulation", key="itb_run", type="primary"):
             symbols = itb_symbols
             if not symbols:
@@ -1157,6 +1214,7 @@ def page_backtest() -> None:
                 result = simulate_intraday_universe(
                     data, params=params, score_threshold=float(ithresh),
                     costs=costs, product="INTRA", allow_reentry=ireentry,
+                    exit_config=itb_exit_cfg,
                 )
             st.session_state["itb_result"] = result
 
@@ -1203,6 +1261,8 @@ def page_backtest() -> None:
                 "Allow re-entries", value=True, key="stb_reentry",
                 help="Take another trade after a prior one closes on the same symbol.",
             )
+
+        stb_exit_cfg = _exit_config_controls("stb", show_time_stop=False)
 
         if st.button("Run swing simulation", key="stb_run", type="primary"):
             symbols = stb_symbols
@@ -1263,7 +1323,7 @@ def page_backtest() -> None:
                 result = simulate_swing_universe(
                     data, params=params, score_threshold=float(sthresh),
                     costs=costs, product="CNC", max_hold_bars=max_hold,
-                    allow_reentry=sreentry,
+                    allow_reentry=sreentry, exit_config=stb_exit_cfg,
                 )
             st.session_state["stb_result"] = result
 

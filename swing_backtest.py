@@ -24,12 +24,13 @@ Design (long-only, matching the scanner's long-biased signals):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pandas as pd
 
 from dhan_algo.backtest import TradingCosts
+from exit_rules import ExitConfig, finalize_long, open_long, step_long
 from indicators import compute_all
 from indicators import breakout, momentum, trend, volatility
 from indicators.volume import swing_score as volume_score
@@ -214,15 +215,24 @@ def simulate_swing(
     product: str = "CNC",
     max_hold_bars: int | None = None,
     allow_reentry: bool = True,
+    exit_config: ExitConfig | None = None,
 ) -> SwingBacktestResult:
     """Simulate long-only swing trades for one symbol on daily bars.
 
     *df* holds daily OHLCV bars (columns ``Open, High, Low, Close, Volume``)
     plus a ``Date``/``Datetime`` column or a datetime index for timestamps.
+
+    *exit_config* enables optional exit-management rules (break-even, trailing
+    stop, partial profit, time stop). When omitted, only the plain ATR
+    stop/target and the ``max_hold_bars`` time cap apply.
     """
     weights = weights or dict(DEFAULT_WEIGHTS)
     params = params or {}
     atr_multiplier = float(params.get("atr_multiplier", 1.5))
+
+    cfg = exit_config or ExitConfig()
+    if cfg.max_hold_bars is None and max_hold_bars is not None:
+        cfg = replace(cfg, max_hold_bars=max_hold_bars)
 
     result = SwingBacktestResult()
     df = df.reset_index() if not isinstance(df.index, pd.RangeIndex) else df.copy()
@@ -242,22 +252,15 @@ def simulate_swing(
     for i in range(n):
         # 1) Manage an open position on this bar.
         if pos is not None:
-            raw_exit = None
-            reason = ""
-            if lows[i] <= pos["stop"]:
-                raw_exit, reason = pos["stop"], "stop"
-            elif highs[i] >= pos["target"]:
-                raw_exit, reason = pos["target"], "target"
-            elif max_hold_bars is not None and (i - pos["entry_idx"]) >= max_hold_bars:
-                raw_exit, reason = closes[i], "time"
-            elif i == last_idx:
-                raw_exit, reason = closes[i], "end"
-
-            if raw_exit is not None:
+            closed, reason = step_long(
+                pos, highs[i], lows[i], closes[i], i,
+                is_last=(i == last_idx), cfg=cfg, end_reason="end",
+            )
+            if closed:
                 result.trades.append(
                     _close_trade(
-                        symbol, pos, raw_exit, reason,
-                        _row_time(df.iloc[i], i), i, qty, costs, product,
+                        symbol, pos, reason, _row_time(df.iloc[i], i), i,
+                        qty, costs, product,
                     )
                 )
                 pos = None
@@ -277,16 +280,17 @@ def simulate_swing(
                             entry_fill = (
                                 costs.slippage_price("BUY", entry_raw) if costs else entry_raw
                             )
-                            pos = {
-                                "entry_fill": entry_fill,
-                                "stop": stop,
-                                "target": target,
-                                "entry_idx": i,
-                                "entry_time": _row_time(df.iloc[i], i),
-                                "entry_charge": (
+                            pos = open_long(
+                                entry_fill=entry_fill,
+                                stop=stop,
+                                target=target,
+                                entry_idx=i,
+                                entry_time=_row_time(df.iloc[i], i),
+                                qty=qty,
+                                entry_charge=(
                                     costs.total("BUY", entry_fill, qty, product) if costs else 0.0
                                 ),
-                            }
+                            )
                             traded = True
 
     return result
@@ -295,7 +299,6 @@ def simulate_swing(
 def _close_trade(
     symbol: str,
     pos: dict[str, Any],
-    raw_exit: float,
     reason: str,
     exit_time: str,
     exit_idx: int,
@@ -303,31 +306,22 @@ def _close_trade(
     costs: TradingCosts | None,
     product: str,
 ) -> SwingTrade:
-    entry_fill = pos["entry_fill"]
-    exit_fill = costs.slippage_price("SELL", raw_exit) if costs else raw_exit
-    exit_charge = costs.total("SELL", exit_fill, qty, product) if costs else 0.0
-    cost = pos["entry_charge"] + exit_charge
-
-    gross = (exit_fill - entry_fill) * qty
-    net = gross - cost
-    risk = entry_fill - pos["stop"]
-    r_mult = (exit_fill - entry_fill) / risk if risk > 0 else 0.0
-
+    pnl = finalize_long(pos, costs, product)
     return SwingTrade(
         symbol=symbol,
         entry_time=pos["entry_time"],
         exit_time=exit_time,
         qty=qty,
-        entry_price=round(entry_fill, 2),
-        exit_price=round(exit_fill, 2),
-        stop=round(pos["stop"], 2),
+        entry_price=round(pos["entry_fill"], 2),
+        exit_price=round(pnl["avg_exit"], 2),
+        stop=round(pos["initial_stop"], 2),
         target=round(pos["target"], 2),
         exit_reason=reason,
         bars_held=exit_idx - pos["entry_idx"],
-        gross_pnl=round(gross, 2),
-        cost=round(cost, 2),
-        net_pnl=round(net, 2),
-        r_multiple=round(r_mult, 2),
+        gross_pnl=round(pnl["gross"], 2),
+        cost=round(pnl["cost"], 2),
+        net_pnl=round(pnl["net"], 2),
+        r_multiple=round(pnl["r_multiple"], 2),
     )
 
 
@@ -342,6 +336,7 @@ def simulate_swing_universe(
     product: str = "CNC",
     max_hold_bars: int | None = None,
     allow_reentry: bool = True,
+    exit_config: ExitConfig | None = None,
     progress_cb=None,
 ) -> SwingBacktestResult:
     """Run :func:`simulate_swing` over many symbols and merge the trades.
@@ -357,6 +352,7 @@ def simulate_swing_universe(
                 score_threshold=score_threshold, qty=qty,
                 costs=costs, product=product,
                 max_hold_bars=max_hold_bars, allow_reentry=allow_reentry,
+                exit_config=exit_config,
             )
             merged.trades.extend(res.trades)
         except Exception:

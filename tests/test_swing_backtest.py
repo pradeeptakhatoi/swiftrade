@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from dhan_algo.backtest import TradingCosts
+from exit_rules import ExitConfig
 from swing_backtest import (
     SwingBacktestResult,
     simulate_swing,
@@ -144,6 +145,36 @@ class TestResultStats:
         assert 0.0 <= res.win_rate <= 100.0
         assert res.profit_factor >= 0.0
         assert res.avg_bars_held >= 0.0
+
+
+class TestExitConfig:
+    def test_exit_config_max_hold_matches_param(self):
+        closes = [100 + i * 0.1 for i in range(_N)]
+        via_param = simulate_swing(
+            "SYM", _bars(closes), params={"atr_multiplier": 100.0},
+            score_threshold=0.0, allow_reentry=False, max_hold_bars=3,
+        )
+        via_cfg = simulate_swing(
+            "SYM", _bars(closes), params={"atr_multiplier": 100.0},
+            score_threshold=0.0, allow_reentry=False,
+            exit_config=ExitConfig(max_hold_bars=3),
+        )
+        assert via_param.trades[0].exit_reason == "time"
+        assert via_cfg.trades[0].exit_reason == "time"
+        assert via_param.trades[0].bars_held == via_cfg.trades[0].bars_held == 3
+
+    def test_trailing_stop_changes_exit(self):
+        # Rise then pull back: a tight trailing stop should exit on "stop"
+        # rather than riding to the end of data.
+        rise = [100 + i * 0.5 for i in range(MIN_BARS)]
+        tail = [rise[-1] + 5, rise[-1] + 6, rise[-1] - 5, rise[-1] - 6]
+        res = simulate_swing(
+            "SYM", _bars(rise + tail), params={"atr_multiplier": 3.0},
+            score_threshold=0.0, allow_reentry=False,
+            exit_config=ExitConfig(trail_r=0.5),
+        )
+        assert res.total_trades == 1
+        assert res.trades[0].exit_reason in {"stop", "target"}
 
 
 class TestUniverse:
