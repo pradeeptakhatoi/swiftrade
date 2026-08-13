@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 from datetime import date, timedelta
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -249,6 +250,143 @@ def render_trade_pnl(
         f"Buy {qty} @ {entry:,.2f} ({product}). "
         f"Estimated per NSE charges; actuals may differ."
     )
+
+
+# ---------------------------------------------------------------------------
+# Price charts — candlesticks with entry / stop / target levels
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_ohlc(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """Fetch OHLC candles for *symbol* from Yahoo Finance (cached 5 min)."""
+    try:
+        df = yf.download(
+            f"{symbol.upper()}.NS", period=period, interval=interval,
+            progress=False, auto_adjust=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    dt_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df = df.rename(columns={dt_col: "Date"})
+    keep = [c for c in ("Date", "Open", "High", "Low", "Close") if c in df.columns]
+    return df[keep].dropna()
+
+
+def _candlestick_chart(
+    df: pd.DataFrame,
+    *,
+    entry: float | None = None,
+    stop: float | None = None,
+    target: float | None = None,
+    height: int = 320,
+) -> alt.LayerChart:
+    """Build a candlestick chart with optional horizontal level lines."""
+    df = df.copy()
+    df["up"] = df["Close"] >= df["Open"]
+    color = alt.condition(
+        "datum.up", alt.value("#26a69a"), alt.value("#ef5350")
+    )
+    base = alt.Chart(df).encode(x=alt.X("Date:T", title=None))
+    wick = base.mark_rule().encode(
+        y=alt.Y("Low:Q", title="Price", scale=alt.Scale(zero=False)),
+        y2="High:Q",
+        color=color,
+    )
+    body = base.mark_bar().encode(y="Open:Q", y2="Close:Q", color=color)
+    layers: list[alt.Chart] = [wick, body]
+
+    for value, label, col in (
+        (entry, "Entry", "#2962ff"),
+        (stop, "Stop", "#ef5350"),
+        (target, "Target", "#26a69a"),
+    ):
+        if value and value > 0:
+            level = pd.DataFrame({"y": [value], "label": [f"{label} {value:,.2f}"]})
+            layers.append(
+                alt.Chart(level).mark_rule(strokeDash=[6, 4], color=col).encode(y="y:Q")
+            )
+            layers.append(
+                alt.Chart(level).mark_text(
+                    align="left", baseline="bottom", dx=3, color=col
+                ).encode(y="y:Q", text="label:N", x=alt.value(3))
+            )
+
+    return alt.layer(*layers).properties(height=height)
+
+
+def render_price_chart(
+    symbol: str,
+    *,
+    entry: float | None = None,
+    stop: float | None = None,
+    target: float | None = None,
+    interval: str = "1d",
+    period: str = "6mo",
+    container=st,
+) -> None:
+    """Fetch candles for *symbol* and draw them with entry/stop/target lines."""
+    df = _fetch_ohlc(symbol, interval, period)
+    if df.empty:
+        container.info(f"No chart data available for {symbol}.")
+        return
+    chart = _candlestick_chart(df, entry=entry, stop=stop, target=target)
+    container.altair_chart(chart, use_container_width=True)
+
+
+def render_backtest_chart(all_bars: dict[str, list], fills: list, container=st) -> None:
+    """Plot a tested symbol's price line with BUY/SELL trade markers."""
+    symbols = list(all_bars.keys())
+    if not symbols:
+        return
+    if len(symbols) == 1:
+        sym = symbols[0]
+    else:
+        sym = container.selectbox("Chart symbol", symbols, key="bt_chart_sym")
+    bars = all_bars.get(sym, [])
+    if not bars:
+        return
+
+    price_df = pd.DataFrame(bars)
+    price_df["timestamp"] = pd.to_datetime(price_df["timestamp"], errors="coerce")
+    price_df = price_df.dropna(subset=["timestamp"])
+    line = alt.Chart(price_df).mark_line(color="#42a5f5").encode(
+        x=alt.X("timestamp:T", title=None),
+        y=alt.Y("close:Q", title="Price", scale=alt.Scale(zero=False)),
+    )
+    layers: list[alt.Chart] = [line]
+
+    fill_df = pd.DataFrame([asdict(f) for f in fills]) if fills else pd.DataFrame()
+    if not fill_df.empty:
+        fill_df = fill_df[fill_df["security_id"] == sym].copy()
+        fill_df["timestamp"] = pd.to_datetime(fill_df["timestamp"], errors="coerce")
+        fill_df = fill_df.dropna(subset=["timestamp"])
+        if not fill_df.empty:
+            markers = alt.Chart(fill_df).mark_point(
+                size=90, filled=True, opacity=0.9
+            ).encode(
+                x="timestamp:T",
+                y="price:Q",
+                color=alt.Color(
+                    "side:N",
+                    scale=alt.Scale(domain=["BUY", "SELL"], range=["#26a69a", "#ef5350"]),
+                    legend=alt.Legend(title="Trade"),
+                ),
+                shape=alt.Shape(
+                    "side:N",
+                    scale=alt.Scale(domain=["BUY", "SELL"], range=["triangle-up", "triangle-down"]),
+                    legend=None,
+                ),
+                tooltip=["timestamp:T", "side:N", "price:Q", "qty:Q"],
+            )
+            layers.append(markers)
+
+    container.altair_chart(alt.layer(*layers).properties(height=320), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1215,9 @@ def _run_and_display_backtest(all_bars: dict[str, list]) -> None:
             f"=  Net {result.net_pnl:,.0f}"
         )
 
+    st.caption("Price & trades")
+    render_backtest_chart(all_bars, result.fills)
+
     if result.positions:
         with st.expander("Open positions"):
             st.json(result.positions)
@@ -1352,6 +1493,16 @@ def page_intraday() -> None:
 """,
         unsafe_allow_html=True,
     )
+
+    # Intraday price chart with the trade levels overlaid.
+    _iv = int(st.session_state.get("intra_interval", 15))
+    _yf_iv = {1: "1m", 5: "5m", 15: "15m"}.get(_iv, "15m")
+    _yf_period = "5d" if _iv == 1 else "1mo"
+    with st.expander(f"Price chart — {selected_ticker} ({_yf_iv})", expanded=True):
+        render_price_chart(
+            selected_ticker, entry=entry, stop=sl, target=t1,
+            interval=_yf_iv, period=_yf_period,
+        )
 
     # Position sizing info
     _entry_default = round(entry if entry > 0 else row["price"], 2)
@@ -1634,6 +1785,16 @@ def page_swing() -> None:
             f"%B {row.get('pct_b', 0):.2f}  ·  ATR {row.get('atr_pct', 0):.2f}%"
         )
 
+    # Daily price chart with the trade levels overlaid.
+    with st.expander(f"Price chart — {selected_ticker} (daily, 6mo)", expanded=True):
+        render_price_chart(
+            selected_ticker,
+            entry=row.get("entry", 0),
+            stop=row.get("stop_loss", 0),
+            target=row.get("target1", 0),
+            interval="1d", period="6mo",
+        )
+
     _sw_entry_default = round(row.get("entry", row["price"]), 2)
     _sw_sl_default = round(row.get("stop_loss", row["price"] * 0.97), 2)
     _sw_target_default = round(row.get("target1", row["price"] * 1.05), 2)
@@ -1897,6 +2058,20 @@ def page_tomorrow() -> None:
         "confirm on your own analysis before trading. Use the **Swing Scanner** "
         "page to size and place an order for any of these symbols."
     )
+
+    # Price chart with trade levels for a chosen pick.
+    pick_syms = [p["ticker"] for p in picks]
+    chart_sym = st.selectbox("Chart symbol", pick_syms, key="tm_chart_sym")
+    chart_row = next((p for p in picks if p["ticker"] == chart_sym), None)
+    if chart_row is not None:
+        with st.expander(f"Price chart — {chart_sym} (daily, 6mo)", expanded=True):
+            render_price_chart(
+                chart_sym,
+                entry=chart_row.get("entry", 0),
+                stop=chart_row.get("stop_loss", 0),
+                target=chart_row.get("target1", 0),
+                interval="1d", period="6mo",
+            )
 
 
 def page_settings() -> None:
